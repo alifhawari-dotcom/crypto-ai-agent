@@ -15,7 +15,7 @@ jobs:
         with:
           python-version: '3.9'
       - name: Install dependencies
-        run: pip install ccxt google-generativeai requests
+        run: pip install ccxt google-generativeai requests aiohttp
       - name: Run Bot
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
