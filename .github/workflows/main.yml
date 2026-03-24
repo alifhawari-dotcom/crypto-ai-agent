@@ -15,7 +15,7 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install dependencies
-        run: pip install ccxt google-genai aiohttp # Pakai google-genai, bukan google-generativeai
+        run: pip install ccxt requests aiohttp # Lebih simpel, tanpa library AI yang berat
       - name: Run Bot
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
