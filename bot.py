@@ -3,7 +3,7 @@ import asyncio
 import logging
 import aiohttp
 import ccxt.async_support as ccxt
-from google import genai # Import library terbaru 2026
+from google import genai # Library standar 2026
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -12,41 +12,39 @@ TG_TOKEN = os.getenv('TELEGRAM_TOKEN')
 TG_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
 async def get_market_data():
+    # Mengambil data dari Gate.io (Bursa paling aman dari blokir IP GitHub)
     exchange = ccxt.gate({'options': {'defaultType': 'swap'}, 'enableRateLimit': True})
     try:
         tickers = await exchange.fetch_tickers()
+        # Ambil 15 koin dengan volume tertinggi
         top_coins = sorted(tickers.values(), key=lambda x: x['quoteVolume'] if x['quoteVolume'] else 0, reverse=True)[:15]
-        market_summary = []
-        for coin in top_coins:
-            market_summary.append({
-                'koin': coin['symbol'].split(':')[0],
-                'harga': coin['last'],
-                'perubahan_24j': f"{coin['percentage']}%",
-                'vol_24j': f"{coin['quoteVolume']:,.0f} USDT"
+        summary = []
+        for c in top_coins:
+            summary.append({
+                'koin': c['symbol'].split(':')[0],
+                'harga': c['last'],
+                'change': f"{c['percentage']}%",
+                'vol': f"{c['quoteVolume']:,.0f} USDT"
             })
-        return market_summary
+        return summary
     finally:
         await exchange.close()
 
 def ask_ai_agent(data_list):
-    # Inisialisasi Client Gemini versi terbaru
+    # Menggunakan Client baru versi 2026
     client = genai.Client(api_key=GEMINI_KEY)
     
-    prompt = f"""
-    Kamu adalah Senior Trader Crypto. Analisis koin top volume ini: {data_list}. 
-    Pilih 1 koin terbaik (Long/Short), berikan alasan teknis, dan Trading Plan (Entry, SL, TP). 
-    Gunakan bahasa Indonesia santai.
-    """
+    prompt = f"Analisis data koin top volume ini: {data_list}. Pilih 1 koin terbaik (Long/Short), berikan alasan teknis, dan Trading Plan (Entry, SL, TP). Gunakan bahasa Indonesia santai."
     
     try:
-        # Cara panggil model di library terbaru
+        # Perintah baru untuk generate content
         response = client.models.generate_content(
             model="gemini-1.5-flash", 
             contents=prompt
         )
         return response.text
     except Exception as e:
-        return f"AI sedang maintenance: {e}"
+        return f"Waduh, AI lagi pusing: {e}"
 
 async def send_to_telegram(text):
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
@@ -56,12 +54,12 @@ async def send_to_telegram(text):
 
 async def main():
     if not all([GEMINI_KEY, TG_TOKEN, TG_CHAT_ID]): return
-    logging.info("Memulai scanning koin top volume...")
+    logging.info("Memulai pemindaian...")
     try:
         data = await get_market_data()
         analysis = ask_ai_agent(data)
         await send_to_telegram(analysis)
-        logging.info("Laporan dikirim!")
+        logging.info("Sukses!")
     except Exception as e:
         logging.error(f"Error: {e}")
 
