@@ -4,6 +4,7 @@ import logging
 import aiohttp
 import ccxt.async_support as ccxt
 import requests
+import json
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -12,7 +13,6 @@ TG_TOKEN = os.getenv('TELEGRAM_TOKEN')
 TG_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
 async def get_market_data():
-    # Gate.io tetap yang paling aman dari blokir IP GitHub
     exchange = ccxt.gate({'options': {'defaultType': 'swap'}, 'enableRateLimit': True})
     try:
         tickers = await exchange.fetch_tickers()
@@ -29,51 +29,59 @@ async def get_market_data():
     finally:
         await exchange.close()
 
+def get_working_model():
+    """Fungsi untuk mencari model apa yang aktif di akunmu"""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_KEY}"
+    try:
+        response = requests.get(url)
+        models_data = response.json()
+        if 'models' in models_data:
+            # Cari model yang punya kemampuan 'generateContent'
+            for m in models_data['models']:
+                if 'generateContent' in m['supportedGenerationMethods']:
+                    # Kita cari yang versi 'flash' karena gratis dan cepat
+                    if 'flash' in m['name']:
+                        return m['name']
+            return models_data['models'][0]['name']
+    except:
+        pass
+    return "models/gemini-2.0-flash" # Default jika gagal deteksi
+
 def ask_ai_agent(data_list):
-    # DAFTAR MODEL RESMI 2026
-    # Kita gunakan gemini-3-flash sebagai model utama tahun ini
-    model_name = "gemini-3-flash"
+    model_path = get_working_model()
+    logging.info(f"Menggunakan model: {model_path}")
     
-    # Gunakan endpoint v1 (Stable) untuk tahun 2026
-    url = f"https://generativelanguage.googleapis.com/v1/models/{model_name}:generateContent?key={GEMINI_KEY}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/{model_path}:generateContent?key={GEMINI_KEY}"
     headers = {'Content-Type': 'application/json'}
     
-    prompt = f"Sebagai Trader Pro, analisis data koin ini: {data_list}. Pilih 1 koin terbaik, berikan alasan teknis, Entry, SL, dan TP. Gunakan Bahasa Indonesia santai."
+    prompt = f"Analisis data koin ini: {data_list}. Pilih 1 koin terbaik untuk trading, berikan alasan teknis, Entry, SL, dan TP. Gunakan Bahasa Indonesia."
     
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}]
-    }
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
 
     try:
-        response = requests.post(url, headers=headers, json=json.dumps(payload), timeout=15)
+        response = requests.post(url, headers=headers, json=payload)
         res_json = response.json()
-        
         if 'candidates' in res_json:
             return res_json['candidates'][0]['content']['parts'][0]['text']
         else:
-            # Jika Gemini 3 gagal, kita coba model alternatif 2026: gemini-3-flash-lite
-            return "Maaf, sistem AI sedang sinkronisasi. Coba jalankan ulang dalam 1 menit."
+            return f"Error dari Google ({model_path}): {res_json.get('error', {}).get('message', 'Unknown Error')}"
     except Exception as e:
-        return f"Gagal terhubung ke otak AI: {e}"
-
-import json # Pastikan json terimport
+        return f"Koneksi AI terputus: {e}"
 
 async def send_to_telegram(text):
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    payload = {"chat_id": TG_CHAT_ID, "text": f"🚀 **AI TRADING SIGNAL 2026**\n\n{text}", "parse_mode": "Markdown"}
+    payload = {"chat_id": TG_CHAT_ID, "text": f"🚀 **AI TRADING SIGNAL**\n\n{text}", "parse_mode": "Markdown"}
     async with aiohttp.ClientSession() as session:
         await session.post(url, json=payload)
 
 async def main():
-    if not all([GEMINI_KEY, TG_TOKEN, TG_CHAT_ID]): 
-        logging.error("Secrets belum lengkap!")
-        return
+    if not all([GEMINI_KEY, TG_TOKEN, TG_CHAT_ID]): return
     logging.info("Memulai pemindaian pasar...")
     try:
         data = await get_market_data()
         analysis = ask_ai_agent(data)
         await send_to_telegram(analysis)
-        logging.info("Sinyal dikirim!")
+        logging.info("Sinyal berhasil dikirim!")
     except Exception as e:
         logging.error(f"Error: {e}")
 
