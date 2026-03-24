@@ -20,15 +20,15 @@ async def get_coin_metrics(exchange, coin):
         funding_val = f"{funding['fundingRate'] * 100:.4f}%"
         
         # 2. Ambil OI dengan Try-Except terpisah
-        # Jika OI gagal ditarik, bot TIDAK membuang koin ini, melainkan mengisinya dengan "N/A"
+        # Jika OI gagal ditarik di Gate.io, bot TIDAK membuang koin ini, melainkan diisi "N/A"
         try:
             oi_info = await exchange.fetch_open_interest(symbol)
             oi_val = f"{float(oi_info['baseVolume']):,.0f}"
         except:
-            oi_val = "N/A" # Fallback jika API exchange tidak mendukung OI untuk koin ini
+            oi_val = "N/A" 
             
         return {
-            'symbol': symbol.split(':')[0],
+            'symbol': symbol.split(':')[0], # Ambil nama koinnya saja
             'price': coin['last'],
             'change_24h': f"{coin['percentage']:.2f}%",
             'vol_usdt': f"{coin['quoteVolume']:,.0f}",
@@ -37,20 +37,20 @@ async def get_coin_metrics(exchange, coin):
             'high_24h': coin['high']
         }
     except Exception as e:
-        # Munculkan error di log agar kita tahu koin apa yang bermasalah, bukan disembunyikan
         logging.warning(f"Gagal total mengambil data {symbol}: {e}")
         return None
 
 async def get_high_precision_data():
-    # Menggunakan Binance Futures karena dukungan API-nya paling lengkap (Ubah ke gate jika wajib)
-    exchange = ccxt.binanceusdm({'options': {'defaultType': 'swap'}, 'enableRateLimit': True})
+    # KITA GUNAKAN GATE.IO (Aman dari blokir IP Amerika di GitHub Actions)
+    exchange = ccxt.gate({'options': {'defaultType': 'swap'}, 'enableRateLimit': True})
     
     try:
         tickers = await exchange.fetch_tickers()
+        
+        # Ambil Top 30 Koin dengan Volume Terbesar
         top_coins = sorted(tickers.values(), key=lambda x: x['quoteVolume'] if x['quoteVolume'] else 0, reverse=True)[:30]
         
-        # FITUR BARU: Semaphore (Pengatur Lalu Lintas)
-        # Membatasi maksimal hanya 5 request bersamaan agar API exchange tidak marah (Rate Limit)
+        # Semaphore: Membatasi antrean maksimal 5 request bersamaan agar Gate.io tidak marah
         sem = asyncio.Semaphore(5)
         
         async def safe_get_metrics(coin):
@@ -73,7 +73,7 @@ async def ask_ai_agent(data_list):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_KEY}"
     
     prompt = f"""
-    Kamu adalah Senior Crypto Strategist. Analisis data {len(data_list)} koin paling aktif ini:
+    Kamu adalah Senior Crypto Strategist. Analisis data {len(data_list)} koin paling aktif di Gate.io Futures ini:
     {data_list}
     
     Tugasmu:
@@ -103,7 +103,7 @@ async def ask_ai_agent(data_list):
 
 async def send_to_telegram(text):
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    payload = {"chat_id": TG_CHAT_ID, "text": f"🔥 **AI MARKET RADAR**\n\n{text}", "parse_mode": "Markdown"}
+    payload = {"chat_id": TG_CHAT_ID, "text": f"🔥 **AI MARKET RADAR (GATE.IO)**\n\n{text}", "parse_mode": "Markdown"}
     async with aiohttp.ClientSession() as session:
         async with session.post(url, json=payload) as resp:
             return await resp.json()
@@ -113,7 +113,7 @@ async def main():
         logging.error("API Keys belum lengkap di Environment Variables!")
         return
         
-    logging.info("Memulai pemindaian koin teraktif...")
+    logging.info("Memulai pemindaian koin teraktif di Gate.io...")
     try:
         data = await get_high_precision_data()
         logging.info(f"Berhasil mengumpulkan data metrik untuk {len(data)} koin.")
