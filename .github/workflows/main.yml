@@ -9,13 +9,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4 # Update ke v4
+        uses: actions/checkout@v4
       - name: Set up Python
-        uses: actions/setup-python@v5 # Update ke v5
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.11' # Upgrade ke Python 3.11
+          python-version: '3.11'
       - name: Install dependencies
-        run: pip install ccxt google-genai aiohttp # Ganti ke google-genai
+        run: pip install ccxt google-genai aiohttp # Pakai google-genai, bukan google-generativeai
       - name: Run Bot
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
