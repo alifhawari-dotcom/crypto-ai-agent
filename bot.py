@@ -3,7 +3,7 @@ import asyncio
 import logging
 import aiohttp
 import ccxt.async_support as ccxt
-import google.generativeai as genai
+from google import genai # Import library terbaru 2026
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -12,13 +12,10 @@ TG_TOKEN = os.getenv('TELEGRAM_TOKEN')
 TG_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
 async def get_market_data():
-    # Menggunakan Gate.io Swap (Futures)
     exchange = ccxt.gate({'options': {'defaultType': 'swap'}, 'enableRateLimit': True})
     try:
         tickers = await exchange.fetch_tickers()
-        # Ambil 15 koin dengan volume transaksi tertinggi (Uang paling banyak di sini)
         top_coins = sorted(tickers.values(), key=lambda x: x['quoteVolume'] if x['quoteVolume'] else 0, reverse=True)[:15]
-        
         market_summary = []
         for coin in top_coins:
             market_summary.append({
@@ -32,26 +29,24 @@ async def get_market_data():
         await exchange.close()
 
 def ask_ai_agent(data_list):
-    genai.configure(api_key=GEMINI_KEY)
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    # Inisialisasi Client Gemini versi terbaru
+    client = genai.Client(api_key=GEMINI_KEY)
     
     prompt = f"""
-    Kamu adalah Senior Trader Crypto. Berikut adalah data 15 koin dengan volume terbesar saat ini:
-    {data_list}
-    
-    Tugasmu:
-    1. Analisis koin mana yang menunjukkan momentum paling kuat (bullish) atau paling lemah (bearish).
-    2. Pilih HANYA 1 koin terbaik untuk peluang trading (bisa Long atau Short).
-    3. Berikan Trading Plan lengkap:
-       - Alasan Teknis
-       - Entry Area
-       - Target Profit (TP)
-       - Stop Loss (SL)
-    4. Jika pasar benar-benar jelek, katakan 'Wait & See' tapi tetap berikan 1 koin pantauan.
-    Gunakan bahasa Indonesia yang santai tapi profesional. Gunakan Markdown.
+    Kamu adalah Senior Trader Crypto. Analisis koin top volume ini: {data_list}. 
+    Pilih 1 koin terbaik (Long/Short), berikan alasan teknis, dan Trading Plan (Entry, SL, TP). 
+    Gunakan bahasa Indonesia santai.
     """
-    response = model.generate_content(prompt)
-    return response.text
+    
+    try:
+        # Cara panggil model di library terbaru
+        response = client.models.generate_content(
+            model="gemini-1.5-flash", 
+            contents=prompt
+        )
+        return response.text
+    except Exception as e:
+        return f"AI sedang maintenance: {e}"
 
 async def send_to_telegram(text):
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
