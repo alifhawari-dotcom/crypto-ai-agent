@@ -1,21 +1,21 @@
-name: Crypto AI Agent Free
+name: Crypto AI Agent 2026
 on:
   schedule:
-    - cron: '*/20 * * * *' # Berjalan otomatis setiap 20 menit
-  workflow_dispatch: # Memungkinkan kamu menjalankan manual untuk tes
+    - cron: '*/20 * * * *'
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4 # Update ke v4
       - name: Set up Python
-        uses: actions/setup-python@v2
+        uses: actions/setup-python@v5 # Update ke v5
         with:
-          python-version: '3.9'
+          python-version: '3.11' # Upgrade ke Python 3.11
       - name: Install dependencies
-        run: pip install ccxt google-generativeai requests aiohttp
+        run: pip install ccxt google-genai aiohttp # Ganti ke google-genai
       - name: Run Bot
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
