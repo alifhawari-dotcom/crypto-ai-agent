@@ -1,7 +1,8 @@
 name: Crypto AI Agent 2026
+
 on:
-  schedule:
-    - cron: '*/20 * * * *'
+  # Hanya menggunakan pemicu manual / API eksternal
+  # Jadwal cron bawaan GitHub sudah dihapus agar tidak bentrok
   workflow_dispatch:
 
 jobs:
@@ -10,13 +11,16 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          
       - name: Install dependencies
-        # INI YANG DIGANTI: Menambahkan pandas dan numpy
+        # Pastikan pandas dan numpy tetap ada untuk God Mode Matrix
         run: pip install ccxt aiohttp pandas numpy
+        
       - name: Run Bot
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
