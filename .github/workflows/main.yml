@@ -15,7 +15,8 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install dependencies
-        run: pip install ccxt requests aiohttp # Lebih simpel, tanpa library AI yang berat
+        # INI YANG DIGANTI: Menambahkan pandas dan numpy
+        run: pip install ccxt aiohttp pandas numpy
       - name: Run Bot
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
