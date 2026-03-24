@@ -6,7 +6,6 @@ import ccxt.async_support as ccxt
 import requests
 import json
 
-# Setup Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 GEMINI_KEY = os.getenv('GEMINI_API_KEY')
@@ -16,82 +15,85 @@ TG_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 async def get_coin_metrics(exchange, coin):
     symbol = coin['symbol']
     try:
-        # Mengambil OI dan Funding secara paralel (Async)
-        oi_task = exchange.fetch_open_interest(symbol)
-        funding_task = exchange.fetch_funding_rate(symbol)
+        # Kita ambil OI dan Funding sebagai data pendukung untuk AI
+        oi_info = await exchange.fetch_open_interest(symbol)
+        funding = await exchange.fetch_funding_rate(symbol)
         
-        oi_info, funding = await asyncio.gather(oi_task, funding_task)
-        
-        oi_value = float(oi_info['baseVolume']) # Gate.io menggunakan baseVolume
-        funding_rate = funding['fundingRate'] * 100
-        
-        price_change = coin['percentage']
-        current_price = coin['last']
-        high_24h = coin['high']
-        
-        # Logika Screening (Sesuai keinginanmu)
-        if price_change > 0.5 and funding_rate < 0.03:
-            if current_price >= (high_24h * 0.95):
-                distance_to_high = ((high_24h - current_price) / current_price) * 100
-                return {
-                    'symbol': symbol.split(':')[0],
-                    'price': current_price,
-                    'change_24h': f"{price_change:.2f}%",
-                    'open_interest': f"{oi_value:,.0f}",
-                    'funding_rate': f"{funding_rate:.4f}%",
-                    'distance_to_high': f"{distance_to_high:.2f}%"
-                }
+        return {
+            'symbol': symbol.split(':')[0],
+            'price': coin['last'],
+            'change_24h': f"{coin['percentage']:.2f}%",
+            'vol_usdt': f"{coin['quoteVolume']:,.0f}",
+            'oi': f"{float(oi_info['baseVolume']):,.0f}",
+            'funding': f"{funding['fundingRate'] * 100:.4f}%",
+            'high_24h': coin['high']
+        }
     except:
         return None
 
 async def get_high_precision_data():
-    # Gunakan Gate.io agar TIDAK kena blokir lokasi (451 error)
     exchange = ccxt.gate({'options': {'defaultType': 'swap'}, 'enableRateLimit': True})
     try:
         tickers = await exchange.fetch_tickers()
-        top_coins = sorted(tickers.values(), key=lambda x: x['quoteVolume'] if x['quoteVolume'] else 0, reverse=True)[:20]
+        
+        # KITA AMBIL TOP 30 KOIN DENGAN VOLUME TERBESAR
+        # Di sinilah uang berkumpul, pasti ada peluang trading.
+        top_coins = sorted(tickers.values(), key=lambda x: x['quoteVolume'] if x['quoteVolume'] else 0, reverse=True)[:30]
         
         tasks = [get_coin_metrics(exchange, coin) for coin in top_coins]
         results = await asyncio.gather(*tasks)
         return [r for r in results if r is not None]
     finally:
-        await exchange.close()
+        await asyncio.close_all([exchange]) # Memastikan koneksi ditutup rapi
 
 def ask_ai_agent(data_list):
-    if not data_list:
-        return "📉 Pasar sedang tenang. Belum ada koin yang masuk radar breakout."
-
-    # Gunakan Model 2.5 Flash lewat Direct API (Anti Error 404)
-    model_name = "gemini-2.5-flash"
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_KEY}"
+    # Jika data ada, kita paksa AI untuk memberikan analisis terbaiknya
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_KEY}"
     
-    prompt = f"Sebagai Crypto Analyst, analisis data koin ini: {data_list}. Pilih 1 koin terbaik, jelaskan alasan teknisnya, lalu berikan Trading Plan (Entry, SL, TP). Gunakan Bahasa Indonesia."
+    prompt = f"""
+    Kamu adalah Senior Crypto Strategist. Analisis data 30 koin paling aktif ini:
+    {data_list}
+    
+    Tugasmu:
+    1. Dari 30 koin ini, pilih 1 koin yang paling menjanjikan untuk Open Posisi SEKARANG.
+    2. Kamu boleh memilih LONG (jika koin kuat) atau SHORT (jika koin sudah overbought/lemah).
+    3. Jelaskan analisismu secara singkat (lihat korelasi antara Harga, Volume, dan Funding Rate).
+    4. Berikan Trading Plan:
+       - 🎯 Aksi: (LONG / SHORT)
+       - 🟢 Entry Area
+       - 🔴 Stop Loss
+       - 🏁 Take Profit
+    Gunakan Bahasa Indonesia yang tajam dan to-the-point. Format Markdown rapi.
+    """
     
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
     
     try:
-        response = requests.post(url, json=payload, timeout=15)
-        res_json = response.json()
-        return res_json['candidates'][0]['content']['parts'][0]['text']
+        response = requests.post(url, json=payload, timeout=20)
+        return response.json()['candidates'][0]['content']['parts'][0]['text']
     except:
-        return "⚠️ Gagal mendapatkan analisis dari AI."
+        return "⚠️ AI sedang kewalahan menganalisis pasar yang ramai. Coba cek beberapa saat lagi."
 
 async def send_to_telegram(text):
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    payload = {"chat_id": TG_CHAT_ID, "text": f"🚀 **AI TRADING SIGNAL**\n\n{text}", "parse_mode": "Markdown"}
+    payload = {"chat_id": TG_CHAT_ID, "text": f"🔥 **AI MARKET RADAR (TOP 30)**\n\n{text}", "parse_mode": "Markdown"}
     async with aiohttp.ClientSession() as session:
-        await session.post(url, json=payload)
+        async with session.post(url, json=payload) as resp:
+            return await resp.json()
 
 async def main():
     if not all([GEMINI_KEY, TG_TOKEN, TG_CHAT_ID]): return
-    logging.info("Memulai scanning pasar...")
+    logging.info("Memulai pemindaian 30 koin teraktif...")
     try:
         data = await get_high_precision_data()
+        logging.info(f"Berhasil mengumpulkan data {len(data)} koin.")
         analysis = ask_ai_agent(data)
         await send_to_telegram(analysis)
-        logging.info("Selesai! Pesan terkirim.")
+        logging.info("Laporan dikirim!")
     except Exception as e:
         logging.error(f"Error: {e}")
+    finally:
+        await asyncio.sleep(0.5)
 
 if __name__ == "__main__":
     asyncio.run(main())
