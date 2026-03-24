@@ -21,21 +21,15 @@ async def get_god_mode_metrics(exchange, coin):
         if not ohlcv or len(ohlcv) < 50:
             return None
             
-        # Ubah ke Pandas DataFrame untuk perhitungan matematika ala TradingView
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         
-        # --- 1. CORE SCORING ENGINE (Pine Script Translation) ---
-        
-        # Net Delta Volume (Flow)
+        # --- 1. CORE SCORING ENGINE ---
         v_range = df['high'] - df['low']
-        # Mencegah error pembagian dengan 0
         df['n_delta'] = np.where(v_range == 0, 0, ((df['close'] - df['low']) - (df['high'] - df['close'])) / v_range * df['volume'])
         
-        # Flow Score (SMA 20)
         df['a_delta'] = df['n_delta'].abs().rolling(20).mean()
         df['s_flow'] = np.clip((df['n_delta'] / np.where(df['a_delta'] == 0, 1, df['a_delta'])) * 20, -40, 40)
         
-        # Momentum Score (RSI 14 ala TradingView)
         delta = df['close'].diff()
         gain = delta.where(delta > 0, 0).ewm(alpha=1/14, adjust=False).mean()
         loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
@@ -43,36 +37,30 @@ async def get_god_mode_metrics(exchange, coin):
         df['rsi'] = 100 - (100 / (1 + rs))
         df['s_mom'] = np.clip((df['rsi'] - 50) * 1.2, -30, 30)
         
-        # Total Power Score (Flow + Momentum)
         df['power_score'] = df['s_flow'] + df['s_mom']
         
-        # --- 2. WHALE DETECTION (Z-SCORE) ---
+        # --- 2. WHALE DETECTION ---
         vol_avg = df['volume'].rolling(20).mean()
         vol_std = df['volume'].rolling(20).std()
         df['z_score'] = (df['volume'] - vol_avg) / np.where(vol_std == 0, 1, vol_std)
         
-        # AMBIL DATA CANDLE TERAKHIR
         latest = df.iloc[-1]
-        
-        # Terjemahan HUD Visual
         z_val = latest['z_score']
-        w_txt = "NUCLEAR" if z_val > 3.5 else "ACTIVE" if z_val > 2.0 else "QUIET"
-        
         p_score = latest['power_score']
-        sync_stat = "FULL BULL" if p_score >= 40 else "FULL BEAR" if p_score <= -40 else "NEUTRAL"
         
-        # Hanya kirim koin yang ada pergerakan Whale (Active/Nuclear) ATAU ada Full Sync
-        if w_txt == "QUIET" and sync_stat == "NEUTRAL":
-            return None 
+        # STANDAR DITURUNKAN: Label diperhalus agar AI punya opsi
+        w_txt = "NUCLEAR" if z_val > 3.0 else "ACTIVE" if z_val > 1.2 else "QUIET"
+        sync_stat = "FULL BULL" if p_score >= 40 else "BULLISH" if p_score > 10 else "FULL BEAR" if p_score <= -40 else "BEARISH" if p_score < -10 else "NEUTRAL"
 
+        # FILTER DIHAPUS: Semua data dikembalikan untuk diranking
         return {
             'Symbol': symbol.split(':')[0],
             'Price': latest['close'],
             'Matrix_Sync': sync_stat,
-            'Power_Score': f"{p_score:.1f}/100",
+            'Power_Score': round(p_score, 1), # Angka float agar bisa disortir
             'Whale_Action': w_txt,
-            'RSI_1H': f"{latest['rsi']:.1f}",
-            'Volume_Surge': f"{z_val:.2f}x StdDev"
+            'RSI_1H': round(latest['rsi'], 1),
+            'Volume_Surge': round(z_val, 2)
         }
     except Exception as e:
         return None
@@ -81,7 +69,7 @@ async def get_high_precision_data():
     exchange = ccxt.gate({'options': {'defaultType': 'swap'}, 'enableRateLimit': True})
     try:
         tickers = await exchange.fetch_tickers()
-        # Filter Top 40 Koin teraktif
+        # Ambil Top 40 berdasarkan Volume USDT
         top_coins = sorted(tickers.values(), key=lambda x: x['quoteVolume'] if x['quoteVolume'] else 0, reverse=True)[:40]
         
         sem = asyncio.Semaphore(5)
@@ -92,30 +80,34 @@ async def get_high_precision_data():
                 
         tasks = [safe_get_metrics(coin) for coin in top_coins]
         results = await asyncio.gather(*tasks)
+        valid_results = [r for r in results if r is not None]
         
-        # Saring hasil
-        return [r for r in results if r is not None]
+        # SISTEM RANKING: Urutkan berdasarkan Power Score paling kuat (entah itu + atau -)
+        # Ambil 15 koin teratas yang paling "bergejolak" untuk disuapkan ke AI
+        sorted_results = sorted(valid_results, key=lambda x: abs(x['Power_Score']), reverse=True)[:15]
+        
+        return sorted_results
     finally:
         await exchange.close()
 
 async def ask_ai_agent(data_list):
     if not data_list:
-        return "⚠️ Pasar sedang tenang. Tidak ada 'Whale Action' atau 'Matrix Sync' yang terdeteksi saat ini."
+        return "⚠️ Kesalahan koneksi, gagal mengambil data pasar."
         
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_KEY}"
     
     prompt = f"""
-    Kamu adalah AI Sniper Trading untuk institusi. Berikut adalah data hasil penyaringan algoritma "God Mode Matrix" (RSI, Whale Z-Score, Power Score):
+    Kamu adalah AI Trader Assistant. Berikut adalah 15 koin paling bergejolak di pasar saat ini berdasarkan algoritma "God Mode Matrix":
     {data_list}
     
     Tugasmu:
-    1. Analisis data tersebut dan pilih TEPAT 3 KOIN TERBAIK yang memiliki tingkat akurasi tertinggi untuk dieksekusi sekarang.
-    2. Prioritaskan koin dengan status 'FULL BULL / FULL BEAR' dan Whale Action 'NUCLEAR / ACTIVE'.
-    3. Buat 3 list singkat dengan format Markdown yang rapi.
+    1. WAJIB pilih TEPAT 3 KOIN TERBAIK dari daftar tersebut untuk dijadikan opsi trading.
+    2. Jika tidak ada yang sempurna (Nuclear/Full Sync), pilihlah yang paling "mendingan" atau memiliki setup momentum terbaik (Power Score tertinggi atau terendah).
+    3. Buat 3 list singkat dengan format Markdown.
     
     Format Wajib untuk masing-masing koin:
     ### 1. [Nama Koin] - [Aksi: LONG/SHORT]
-    * **Alasan (1 kalimat):** (Sebutkan korelasi Power Score dan Whale Action)
+    * **Alasan (1 kalimat):** (Sebutkan korelasi Matrix Sync, Power Score, dan Volume)
     * **Plan:** Entry: [Area] | SL: [Harga] | TP: [Harga]
     """
     
@@ -134,25 +126,4 @@ async def ask_ai_agent(data_list):
 
 async def send_to_telegram(text):
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    payload = {"chat_id": TG_CHAT_ID, "text": f"👁️ **GOD MODE MATRIX: SNIPER REPORT**\n\n{text}", "parse_mode": "Markdown"}
-    async with aiohttp.ClientSession() as session:
-        await session.post(url, json=payload)
-
-async def main():
-    if not all([GEMINI_KEY, TG_TOKEN, TG_CHAT_ID]): 
-        logging.error("API Keys belum lengkap!")
-        return
-        
-    logging.info("Memulai pemindaian God Mode Matrix (Candle 1H)...")
-    try:
-        data = await get_high_precision_data()
-        logging.info(f"Ditemukan {len(data)} koin yang masuk radar Whale/Sync.")
-        
-        analysis = await ask_ai_agent(data) 
-        await send_to_telegram(analysis)
-        logging.info("Laporan Sniper sukses dikirim ke Telegram!")
-    except Exception as e:
-        logging.error(f"Sistem Error: {e}")
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    payload = {"chat_id": TG_CHAT_ID,
