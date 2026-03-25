@@ -31,7 +31,10 @@ RSI_PERIOD   = 14
 EMA_FAST     = 20
 EMA_SLOW     = 50
 EMA_TREND    = 200
-SWING_LOOKBACK = 20         # Lookback candle untuk deteksi Swing High/Low
+SWING_LOOKBACK = 10         # Lookback per sisi untuk deteksi Swing H/L
+                            # 10 = butuh 21 candle konfirmasi (lebih realistis)
+                            # Rumus: butuh minimal (lookback*2+1) candle konfirmasi
+                            # Dengan 100 candle tersedia, lookback 10 memberi ~37 swing candidate
 
 # ============================================================
 # FIX #1 — RATE LIMIT STRATEGY
@@ -52,13 +55,21 @@ RETRY_DELAY  = 5
 # ============================================================
 
 def calc_atr(df: pd.DataFrame, period: int = ATR_PERIOD) -> pd.Series:
+    """
+    ATR dengan anomaly filter (dari v4.0).
+    TR ekstrem >4x median rolling-50 diganti median — melindungi SL/TP
+    dari distorsi flash crash / candle spike palsu.
+    """
     high, low, prev_close = df['high'], df['low'], df['close'].shift(1)
     tr = pd.concat([
         high - low,
         (high - prev_close).abs(),
         (low  - prev_close).abs()
     ], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
+    # Anomaly filter: TR spike > 4x median → ganti dengan median
+    tr_median = tr.rolling(50, min_periods=1).median()
+    tr_clean  = pd.Series(np.where(tr > (tr_median * 4), tr_median, tr), index=df.index)
+    return tr_clean.rolling(period).mean()
 
 
 def calc_rsi(close: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
@@ -81,46 +92,88 @@ def calc_macd(close: pd.Series):
     return macd, signal, macd - signal
 
 
+def calc_squeeze(df: pd.DataFrame, atr: pd.Series) -> pd.Series:
+    """
+    Squeeze Momentum Detection (dari v4.0).
+    Squeeze ON = Bollinger Bands masuk ke dalam Keltner Channel.
+    Artinya: volatilitas dimampatkan → siap meledak (breakout imminent).
+    BB upper < KC upper DAN BB lower > KC lower = squeeze aktif.
+    """
+    close  = df['close']
+    sma20  = close.rolling(20).mean()
+    std20  = close.rolling(20).std()
+    bb_upper = sma20 + (2 * std20)
+    bb_lower = sma20 - (2 * std20)
+    kc_upper = sma20 + (1.5 * atr)
+    kc_lower = sma20 - (1.5 * atr)
+    return (bb_upper < kc_upper) & (bb_lower > kc_lower)
+
+
 # ============================================================
 # FIX #3 — MARKET STRUCTURE: SWING HIGH / SWING LOW
 # Deteksi level harga nyata tempat price cenderung reaction.
 # Lebih akurat dari indikator lagging untuk entry/SL/TP.
 # ============================================================
 
+def _find_swings(highs, lows, lookback: int):
+    """Helper: scan raw array untuk swing H/L dengan lookback tertentu."""
+    n = len(highs)
+    sh, sl = [], []
+    for i in range(lookback, n - lookback):
+        lh = highs[i - lookback: i]
+        rh = highs[i + 1: i + lookback + 1]
+        if len(lh) == lookback and len(rh) == lookback:
+            if highs[i] >= max(lh) and highs[i] >= max(rh):
+                sh.append((i, float(highs[i])))
+
+        ll = lows[i - lookback: i]
+        rl = lows[i + 1: i + lookback + 1]
+        if len(ll) == lookback and len(rl) == lookback:
+            if lows[i] <= min(ll) and lows[i] <= min(rl):
+                sl.append((i, float(lows[i])))
+    return sh, sl
+
+
 def calc_swing_levels(df: pd.DataFrame, lookback: int = SWING_LOOKBACK) -> dict:
     """
-    Deteksi Swing High dan Swing Low terbaru dari price action.
-    Swing High = candle dengan high tertinggi dalam window lookback di kiri & kanan.
-    Swing Low  = candle dengan low terendah dalam window lookback di kiri & kanan.
-    Return level harga terbaru yang valid.
+    Deteksi Swing High/Low dari price action dengan adaptive fallback.
+
+    Strategi berlapis (tidak pernah return UNKNOWN):
+    1. Coba lookback yang diminta (default 10)
+    2. Jika gagal, turunkan lookback secara bertahap sampai 3
+    3. Jika masih gagal, gunakan rolling max/min 20-candle sebagai fallback akhir
+       (ini adalah 'struktur statistik', bukan swing ideal, tapi lebih baik daripada None)
     """
     highs = df['high'].values
     lows  = df['low'].values
-    n     = len(df)
 
-    swing_highs = []
-    swing_lows  = []
+    # Coba lookback mulai dari yang diminta, turun sampai 3
+    sh_list, sl_list = [], []
+    for lb in range(lookback, 2, -1):
+        sh_list, sl_list = _find_swings(highs, lows, lb)
+        if sh_list and sl_list:
+            logging.debug(f"Swing ditemukan dengan lookback={lb}: {len(sh_list)}H / {len(sl_list)}L")
+            break
 
-    # Scan dari candle ke-lookback sampai candle ke-(n-lookback-1)
-    # Ini memastikan ada cukup candle di kiri dan kanan untuk konfirmasi
-    for i in range(lookback, n - lookback):
-        left_h  = highs[i - lookback : i]
-        right_h = highs[i + 1 : i + lookback + 1]
-        if highs[i] == max(left_h) and highs[i] == max(right_h):
-            swing_highs.append((i, highs[i]))
+    # Fallback akhir: pakai rolling window max/min jika swing formal tidak ditemukan
+    if not sh_list:
+        window = min(20, len(highs) // 4)
+        fallback_high = df['high'].rolling(window).max().dropna()
+        if not fallback_high.empty:
+            sh_list = [(-1, float(fallback_high.iloc[-1]))]
+        logging.debug("Swing High: fallback ke rolling max")
 
-        left_l  = lows[i - lookback : i]
-        right_l = lows[i + 1 : i + lookback + 1]
-        if lows[i] == min(left_l) and lows[i] == min(right_l):
-            swing_lows.append((i, lows[i]))
+    if not sl_list:
+        window = min(20, len(lows) // 4)
+        fallback_low = df['low'].rolling(window).min().dropna()
+        if not fallback_low.empty:
+            sl_list = [(-1, float(fallback_low.iloc[-1]))]
+        logging.debug("Swing Low: fallback ke rolling min")
 
-    # Ambil Swing High & Low terbaru (paling dekat ke harga sekarang)
-    latest_sh = swing_highs[-1][1] if swing_highs else None
-    latest_sl = swing_lows[-1][1]  if swing_lows  else None
-
-    # Ambil juga yang kedua terbaru sebagai struktur tambahan
-    prev_sh = swing_highs[-2][1] if len(swing_highs) >= 2 else latest_sh
-    prev_sl = swing_lows[-2][1]  if len(swing_lows)  >= 2 else latest_sl
+    latest_sh = sh_list[-1][1] if sh_list else None
+    latest_sl = sl_list[-1][1] if sl_list else None
+    prev_sh   = sh_list[-2][1] if len(sh_list) >= 2 else latest_sh
+    prev_sl   = sl_list[-2][1] if len(sl_list) >= 2 else latest_sl
 
     return {
         'swing_high':      latest_sh,
@@ -160,10 +213,19 @@ def calc_structure_bias(price: float, swing_high: float, swing_low: float) -> st
 # ============================================================
 
 async def fetch_ohlcv_safe(exchange, symbol: str, timeframe: str, limit: int):
+    """
+    Fetch OHLCV dengan timeout eksplisit (dari v4.0) + error handling individual.
+    wait_for mencegah bot hang selamanya jika bursa lambat merespons.
+    """
     try:
-        ohlcv = await exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+        ohlcv = await asyncio.wait_for(
+            exchange.fetch_ohlcv(symbol, timeframe, limit=limit),
+            timeout=10.0
+        )
         if ohlcv and len(ohlcv) >= CANDLES_REQUIRED:
             return pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    except asyncio.TimeoutError:
+        logging.debug(f"fetch_ohlcv {symbol} {timeframe}: Timeout 10s")
     except Exception as e:
         logging.debug(f"fetch_ohlcv {symbol} {timeframe}: {e}")
     return None
@@ -197,6 +259,9 @@ def build_indicators(df: pd.DataFrame) -> dict:
     # Market Structure
     swings = calc_swing_levels(df)
 
+    # Squeeze Detection
+    squeeze = calc_squeeze(df, atr)
+
     latest = df.iloc[-1]
     price  = float(latest['close'])
 
@@ -223,6 +288,7 @@ def build_indicators(df: pd.DataFrame) -> dict:
         'prev_sh':      round(swings['prev_swing_high'], 6) if swings['prev_swing_high'] else None,
         'prev_sl':      round(swings['prev_swing_low'], 6) if swings['prev_swing_low'] else None,
         'struct_bias':  struct_bias,
+        'is_squeezing': bool(squeeze.iloc[-1]),  # True = volatilitas dimampatkan, siap breakout
     }
 
 
@@ -243,27 +309,28 @@ async def phase1_scan(exchange, coin: dict) -> dict | None:
     macd_str = "BULL" if macd_ok else "BEAR"
 
     return {
-        'symbol':       symbol,
-        'Symbol':       symbol.split(':')[0],
-        'Price':        ind['close'],
-        'power_1h':     ind['power_score'],
-        'RSI_1H':       ind['rsi'],
-        'Whale':        whale,
-        'z_score':      z,
-        'MACD_1H':      macd_str,
-        'ATR_1H':       ind['atr'],
-        'EMA_Fast_1H':  ind['ema_fast'],
-        'EMA_Slow_1H':  ind['ema_slow'],
+        'symbol':        symbol,
+        'Symbol':        symbol.split(':')[0],
+        'Price':         ind['close'],
+        'power_1h':      ind['power_score'],
+        'RSI_1H':        ind['rsi'],
+        'Whale':         whale,
+        'z_score':       z,
+        'MACD_1H':       macd_str,
+        'ATR_1H':        ind['atr'],
+        'EMA_Fast_1H':   ind['ema_fast'],
+        'EMA_Slow_1H':   ind['ema_slow'],
         'Swing_High_1H': ind['swing_high'],
         'Swing_Low_1H':  ind['swing_low'],
-        'Struct_1H':    ind['struct_bias'],
+        'Struct_1H':     ind['struct_bias'],
+        'Squeeze_1H':    ind['is_squeezing'],   # ← merge dari v4.0
         # Placeholder, diisi fase 2
-        'Trend_4H':     'PENDING',
-        'RSI_4H':       None,
-        'power_4h':     None,
+        'Trend_4H':      'PENDING',
+        'RSI_4H':        None,
+        'power_4h':      None,
         'Swing_High_4H': None,
         'Swing_Low_4H':  None,
-        'Struct_4H':    'PENDING',
+        'Struct_4H':     'PENDING',
     }
 
 
@@ -328,6 +395,11 @@ def finalize_candidate(c: dict) -> dict:
     td_dir = 1 if trend == 'UPTREND' else (-1 if trend == 'DOWNTREND' else 0)
     if td_dir != 0 and ps_dir != td_dir:
         composite -= 15
+
+    # BONUS: Squeeze aktif → volatilitas dimampatkan, momentum akan meledak
+    # Bonus searah composite (positif = +10 ke bullish, negatif = -10 ke bearish)
+    if c.get('Squeeze_1H', False):
+        composite += 10 if composite > 0 else -10
 
     composite = round(composite, 1)
 
@@ -448,12 +520,15 @@ def format_coin_for_prompt(i: int, d: dict) -> str:
     rr_long    = abs(d['TP1_Long']  - d['Price']) / max(abs(d['Price'] - d['SL_Long']), 1e-9)
     rr_short   = abs(d['TP1_Short'] - d['Price']) / max(abs(d['Price'] - d['SL_Short']), 1e-9)
 
+    squeeze_txt = "🚨 SQUEEZE (Siap Breakout)" if d.get('Squeeze_1H') else "Normal"
+
     return f"""
 **{i}. {d['Symbol']}** (Harga: {d['Price']})
 - Kecenderungan: {action} | Matrix: {d['Matrix_Sync']} | Composite Score: {d['Composite']}
 - Trend 4H: {d['Trend_4H']} | RSI 1H: {d['RSI_1H']} | RSI 4H: {d.get('RSI_4H', 'N/A')}
 - Struktur Harga 1H: {d['Struct_1H']} (Support: {d['Swing_Low_1H']}, Resistance: {d['Swing_High_1H']})
 - Struktur Harga 4H: {d['Struct_4H']} (Support: {d['Swing_Low_4H']}, Resistance: {d['Swing_High_4H']})
+- Volatilitas / Squeeze: {squeeze_txt}
 - Aktivitas Whale: {d['Whale']} (Volume Z-score: {d['z_score']}) | MACD 1H: {d['MACD_1H']}
 - Rencana LONG → Entry: {d['Price']} | SL: {d['SL_Long']} ({risk_long:.1f}% risiko) | TP1: {d['TP1_Long']} | TP2: {d['TP2_Long']} | R:R TP1 ≈ 1:{rr_long:.1f}
 - Rencana SHORT → Entry: {d['Price']} | SL: {d['SL_Short']} ({risk_short:.1f}% risiko) | TP1: {d['TP1_Short']} | TP2: {d['TP2_Short']} | R:R TP1 ≈ 1:{rr_short:.1f}"""
@@ -483,19 +558,29 @@ Pilih **TEPAT 5 KOIN TERBAIK** dari daftar di atas untuk setup swing trading (ho
 
 **KRITERIA SELEKSI (urut prioritas):**
 1. Konfluensi Kuat: Trend 4H sejalan dengan Matrix_Sync dan Struktur Harga
-2. Price Action Valid: Harga di dekat Support/Resistance nyata (Swing Level), bukan di tengah range
-3. Whale + MACD sebagai konfirmasi tambahan
-4. R:R minimal 1:2 di TP1
+2. **Prioritaskan koin dengan tanda SQUEEZE** — volatilitas dimampatkan berarti breakout sudah dekat. Konfirmasi arahnya dengan Matrix + Trend 4H.
+3. Price Action Valid: Harga di dekat Support/Resistance nyata (Swing Level), bukan MID_RANGE
+4. Whale + MACD sebagai konfirmasi tambahan
+5. R:R minimal 1:2 di TP1 — **jika R:R < 1:2 dengan entry di harga sekarang, WAJIB berikan Entry Limit (antre di harga lebih baik) agar R:R tercapai**
+
+**ATURAN ENTRY BERDASARKAN RSI:**
+- RSI 1H > 70 (Overbought): JANGAN entry langsung. Berikan **Entry Limit** di pullback minimal 0.5×ATR dari harga sekarang
+- RSI 1H < 30 (Oversold untuk SHORT): JANGAN entry langsung. Berikan **Entry Limit** di retest minimal 0.5×ATR dari harga sekarang
+- RSI 1H 40–60: Entry market/langsung diperbolehkan
+
+**KONDISI PASAR RANGING (Trend 4H = RANGING):**
+- Jika mayoritas koin menunjukkan RANGING, pilih koin yang harganya di NEAR_SUPPORT (untuk LONG) atau NEAR_RESISTANCE (untuk SHORT) — bukan MID_RANGE
+- TP2 di kondisi ranging: gunakan level Swing High/Low sebagai batas, bukan ATR×3.5
 
 **FORMAT WAJIB untuk setiap koin:**
 
 ### [Nomor]. [NAMA KOIN] — [LONG / SHORT]
-**Konfluensi:** [Sebutkan 3 faktor terkuat secara spesifik, contoh: "Trend 4H UPTREND + harga bounce dari Swing Low 1H di 0.524 + Whale NUCLEAR"]
-**Entry:** [Harga] _(area/level konkret)_
-**Stop Loss:** [Harga] _(sebutkan alasan: "di bawah Swing Low" atau "di atas Swing High")_
+**Konfluensi:** [3 faktor spesifik, contoh: "Trend 4H UPTREND + bounce dari Swing Low 1H di 0.524 + Whale NUCLEAR"]
+**Entry:** [Harga] _(Market / Limit — sebutkan alasannya)_
+**Stop Loss:** [Harga] _(alasan: "di bawah Swing Low di X" atau "di atas Swing High di X")_
 **TP1:** [Harga] | **TP2:** [Harga]
 **Risk/Reward:** [X:Y]
-**🚩 Red Flag / Invalidasi:** [Kondisi spesifik yang membatalkan sinyal ini — WAJIB diisi]
+**🚩 Red Flag / Invalidasi:** [Kondisi SPESIFIK yang membatalkan sinyal — wajib sebut harga atau level]
 
 ---
 Tulis langsung 5 pilihan tanpa pembukaan atau penutupan. Prioritas kejelasan dan akurasi.
@@ -579,12 +664,12 @@ async def main():
 
     timestamp = datetime.now().strftime("%d %b %Y, %H:%M WIB")
     header = (
-        f"🎯 *GOD MODE v3 — TOP 5 SWING SETUPS*\n"
-        f"🕐 {timestamp} | MTF: 4H + 1H | Price Action + Indikator\n"
-        f"{'─' * 34}\n\n"
+        f"🎯 *GOD MODE v3.2 — TOP 5 SWING SETUPS*\n"
+        f"🕐 {timestamp} | MTF: 4H+1H | Squeeze + ATR Shield + Adaptive Swing\n"
+        f"{'─' * 38}\n\n"
     )
 
-    logging.info("🚀 God Mode v3 dimulai...")
+    logging.info("🚀 God Mode v3.2 dimulai...")
 
     try:
         data = await get_high_precision_data()
