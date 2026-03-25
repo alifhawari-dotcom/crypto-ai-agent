@@ -17,21 +17,24 @@ TG_TOKEN   = os.getenv('TELEGRAM_TOKEN')
 TG_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
 # ============================================================
-# CONSTANTS & PARAMETERS (INTRADAY BREAKOUT EDITION)
+# CONSTANTS & PARAMETERS (V4.2 FINAL EDITION)
 # ============================================================
 TOP_COINS_BY_VOLUME = 40    
 RANKED_CANDIDATES   = 12    
 CANDLES_REQUIRED    = 100   
 
-TF_MACRO  = '1h'    # Trend Utama (Untuk hold berjam-jam)
+# KUNCI MANAJEMEN RISIKO
+FIXED_RISK_USD = 1.50   
+
+TF_MACRO  = '1h'    # Trend Utama
 TF_STRUCT = '15m'   # Micro-Structure & Swing Level
 TF_MICRO  = '5m'    # Presisi Volume/Whale Anomaly
 
-ATR_PERIOD   = 14
-RSI_PERIOD   = 14
-EMA_FAST     = 20
-EMA_SLOW     = 50
-EMA_TREND    = 200
+ATR_PERIOD     = 14
+RSI_PERIOD     = 14
+EMA_FAST       = 20
+EMA_SLOW       = 50
+EMA_TREND      = 200
 SWING_LOOKBACK = 10         
 
 SEMAPHORE_PHASE1 = 5   
@@ -48,7 +51,6 @@ RETRY_DELAY  = 5
 def calc_atr(df: pd.DataFrame, period: int = ATR_PERIOD) -> pd.Series:
     high, low, prev_close = df['high'], df['low'], df['close'].shift(1)
     tr = pd.concat([high - low, (high - prev_close).abs(), (low  - prev_close).abs()], axis=1).max(axis=1)
-    # Anomaly filter untuk melindungi SL dari flash crash (jarum panjang)
     tr_median = tr.rolling(50, min_periods=1).median()
     tr_clean  = pd.Series(np.where(tr > (tr_median * 4), tr_median, tr), index=df.index)
     return tr_clean.rolling(period).mean()
@@ -99,15 +101,33 @@ def calc_swing_levels(df: pd.DataFrame, lookback: int = SWING_LOOKBACK) -> dict:
     if not sl_list: sl_list = [(-1, float(df['low'].rolling(20).min().iloc[-1]))]
     return {'swing_high': sh_list[-1][1], 'swing_low': sl_list[-1][1]}
 
+# FIX: Fungsi Deteksi Smart Money Terstruktur
+def detect_smart_money(z_score: float, squeeze: bool) -> dict:
+    if z_score > 3.0:
+        level, bonus = "NUCLEAR", 15
+    elif z_score > 1.5:
+        level, bonus = "ACTIVE", 7
+    else:
+        level, bonus = "QUIET", 0
+    
+    squeeze_bonus = 8 if squeeze else 0
+    return {'whale_level': level, 'sm_bonus': bonus + squeeze_bonus}
+
 # ============================================================
-# DATA PIPELINE (INTRADAY BREAKOUT)
+# DATA PIPELINE
 # ============================================================
 
 async def fetch_ohlcv_safe(exchange, symbol: str, timeframe: str, limit: int):
     try:
         ohlcv = await asyncio.wait_for(exchange.fetch_ohlcv(symbol, timeframe, limit=limit), timeout=10.0)
-        return pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    except: return None
+        # BUG FIX: Pastikan jumlah candle cukup sebelum dikonversi ke DataFrame
+        if ohlcv and len(ohlcv) >= CANDLES_REQUIRED:
+            return pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    except asyncio.TimeoutError:
+        logging.debug(f"fetch_ohlcv {symbol} {timeframe}: Timeout 10s")
+    except Exception as e:
+        logging.debug(f"fetch_ohlcv {symbol} {timeframe}: {e}")
+    return None
 
 def build_indicators(df: pd.DataFrame) -> dict:
     close, high, low, volume = df['close'], df['high'], df['low'], df['volume']
@@ -135,11 +155,9 @@ def build_indicators(df: pd.DataFrame) -> dict:
 
 async def phase1_scan(exchange, coin: dict) -> dict | None:
     symbol = coin['symbol']
-    # Fase 1: Memindai TF 15 Menit (Micro Structure & Squeeze Detection)
     df = await fetch_ohlcv_safe(exchange, symbol, TF_STRUCT, CANDLES_REQUIRED)
     if df is None: return None
     ind = build_indicators(df)
-    
     return {
         'symbol': symbol, 'Symbol': symbol.split(':')[0], 'Price': ind['close'],
         'power_15m': ind['power_score'], 'RSI_15m': ind['rsi'], 'ATR_15m': ind['atr'],
@@ -152,12 +170,11 @@ async def phase2_enrich(exchange, candidate: dict) -> dict:
     symbol = candidate['symbol']
     await asyncio.sleep(PHASE2_DELAY)
     
-    # Fase 2: Paralel ambil Trend 1H dan Presisi/Whale 5m
+    # Fase 2: Tarik 1H (Trend) dan 5m (Whale/Trigger) secara paralel
     task_1h = fetch_ohlcv_safe(exchange, symbol, TF_MACRO, CANDLES_REQUIRED)
     task_5m = fetch_ohlcv_safe(exchange, symbol, TF_MICRO, CANDLES_REQUIRED)
     df_1h, df_5m = await asyncio.gather(task_1h, task_5m)
     
-    # Proses 1H (Trend Makro)
     if df_1h is not None:
         ind1h = build_indicators(df_1h)
         c1h = ind1h['close']
@@ -166,57 +183,65 @@ async def phase2_enrich(exchange, candidate: dict) -> dict:
     else:
         candidate.update({'Trend_1h': 'N/A', 'power_1h': candidate['power_15m']})
 
-    # Proses 5m (Whale Anomaly & Entry Presisi)
     if df_5m is not None:
         ind5m = build_indicators(df_5m)
-        whale = "NUCLEAR (WHALE)" if ind5m['z_score'] > 3.0 else "ACTIVE" if ind5m['z_score'] > 1.5 else "QUIET"
-        candidate.update({'z_score_5m': ind5m['z_score'], 'Whale_5m': whale, 'power_5m': ind5m['power_score']})
+        sm5 = detect_smart_money(ind5m['z_score'], ind5m['is_squeezing'])
+        candidate.update({'z_score_5m': ind5m['z_score'], 'Whale_5m': sm5['whale_level'], 'SM_Bonus': sm5['sm_bonus'], 'power_5m': ind5m['power_score']})
     else:
-        candidate.update({'z_score_5m': 0, 'Whale_5m': 'QUIET', 'power_5m': candidate['power_15m']})
+        candidate.update({'z_score_5m': 0, 'Whale_5m': 'QUIET', 'SM_Bonus': 0, 'power_5m': candidate['power_15m']})
         
     return candidate
+
+def format_qty(qty: float) -> float:
+    """Format kuantitas: Koin murah jadikan int, koin mahal (BTC) beri desimal."""
+    if qty > 100: return int(round(qty, 0))
+    elif qty > 10: return round(qty, 1)
+    elif qty > 1: return round(qty, 2)
+    return round(qty, 4)
 
 def finalize_candidate(c: dict) -> dict:
     p15 = c['power_15m']
     p1h = c.get('power_1h', p15)
     p5m = c.get('power_5m', p15)
     
-    # Bobot: Trend 1H (40%), Structure 15m (40%), Trigger 5m (20%)
     comp = (p1h * 0.40) + (p15 * 0.40) + (p5m * 0.20)
     
-    # Penalti counter-trend
+    # 1. Penalti Counter Trend
     trend = c.get('Trend_1h', 'RANGING')
     td_dir = 1 if trend == 'UPTREND' else (-1 if trend == 'DOWNTREND' else 0)
     if td_dir != 0 and (1 if p15 > 0 else -1) != td_dir: comp -= 15
 
-    # Bonus: Ada Whale 5m + Squeeze 15m = Breakout Imminent!
-    if c['Squeeze_15m']: comp += 10 if comp > 0 else -10
-    if c['z_score_5m'] >= 2.0: comp += 10 if comp > 0 else -10
+    # 2. Smart Money & Squeeze Bonus (Dari v4.0)
+    sm_bonus = c.get('SM_Bonus', 0)
+    if sm_bonus > 0: comp += sm_bonus if comp > 0 else -sm_bonus
+    
+    # 3. 3TF Alignment Bonus (Dari v4.0) - Sinyal paling bersih
+    all_aligned = ((p5m > 0 and p15 > 0 and p1h > 0) or (p5m < 0 and p15 < 0 and p1h < 0))
+    if all_aligned: comp += 5 if comp > 0 else -5
 
     c['Composite'] = round(comp, 1)
     c['Matrix_Sync'] = "FULL BULL" if comp >= 40 else "BULLISH" if comp > 10 else "FULL BEAR" if comp <= -40 else "BEARISH" if comp < -10 else "NEUTRAL"
     
     p, a_15, sh_15, sl_15 = c['Price'], c['ATR_15m'], c['Swing_High_15m'], c['Swing_Low_15m']
     
-    # --- LOGIKA BUY STOP / SELL STOP BREAKOUT ---
-    # Long: Antre Buy Stop sedikit di atas Resistance (Swing High 15m)
-    # Short: Antre Sell Stop sedikit di bawah Support (Swing Low 15m)
-    
     buy_stop_price = round(sh_15 * 1.001, 6) if sh_15 > p else round(p + (a_15 * 0.2), 6)
     sell_stop_price = round(sl_15 * 0.999, 6) if sl_15 < p else round(p - (a_15 * 0.2), 6)
 
-    # SL/TP Adaptive Intraday (Hold berjam-jam, mengacu ATR 15m)
-    # R:R didesain 1:2 hingga 1:3
+    sl_long = round(max(buy_stop_price - a_15 * 1.8, sl_15 * 0.998), 6)
+    sl_short = round(min(sell_stop_price + a_15 * 1.8, sh_15 * 1.002), 6)
+    
+    # KALKULATOR KUANTITAS BERDASARKAN RISK USD
+    risk_dist_long = max(abs(buy_stop_price - sl_long), 1e-9)
+    qty_long = format_qty(FIXED_RISK_USD / risk_dist_long)
+    
+    risk_dist_short = max(abs(sell_stop_price - sl_short), 1e-9)
+    qty_short = format_qty(FIXED_RISK_USD / risk_dist_short)
+
     c.update({
-        'Buy_Stop': buy_stop_price,
-        'SL_Long': round(max(buy_stop_price - a_15 * 1.8, sl_15 * 0.998), 6), 
-        'TP1_Long': round(buy_stop_price + a_15 * 3.0, 6), 
-        'TP2_Long': round(buy_stop_price + a_15 * 5.0, 6),
-        
-        'Sell_Stop': sell_stop_price,
-        'SL_Short': round(min(sell_stop_price + a_15 * 1.8, sh_15 * 1.002), 6), 
-        'TP1_Short': round(sell_stop_price - a_15 * 3.0, 6), 
-        'TP2_Short': round(sell_stop_price - a_15 * 5.0, 6)
+        'Buy_Stop': buy_stop_price, 'SL_Long': sl_long, 'Qty_Long': qty_long,
+        'TP1_Long': round(buy_stop_price + a_15 * 3.0, 6), 'TP2_Long': round(buy_stop_price + a_15 * 5.0, 6),
+        'Sell_Stop': sell_stop_price, 'SL_Short': sl_short, 'Qty_Short': qty_short,
+        'TP1_Short': round(sell_stop_price - a_15 * 3.0, 6), 'TP2_Short': round(sell_stop_price - a_15 * 5.0, 6)
     })
     return c
 
@@ -239,78 +264,80 @@ async def get_high_precision_data():
     finally: await exchange.close()
 
 # ============================================================
-# AI & TELEGRAM (FALLBACK SYSTEM)
+# AI & TELEGRAM (ANTI-ERROR & RETRY FIX)
 # ============================================================
 
 async def send_to_telegram(text: str, header: str = ""):
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     full_text = header + text
     chunks = [full_text[i:i+4000] for i in range(0, len(full_text), 4000)]
-    
     async with aiohttp.ClientSession() as session:
         for chunk in chunks:
             payload = {"chat_id": TG_CHAT_ID, "text": chunk, "parse_mode": "Markdown"}
-            async with session.post(url, json=payload) as resp:
-                if resp.status != 200:
-                    payload.pop("parse_mode") 
-                    await session.post(url, json=payload)
-            await asyncio.sleep(1)
+            for attempt in range(1, MAX_RETRIES + 1):
+                try:
+                    async with session.post(url, json=payload, timeout=15) as resp:
+                        if resp.status == 200: break
+                        if resp.status == 400: # Telegram format error
+                            payload.pop("parse_mode")
+                            await session.post(url, json=payload)
+                            break
+                except: pass
+                await asyncio.sleep(RETRY_DELAY)
 
 def format_coin_for_prompt(i: int, d: dict) -> str:
     action = "LONG (BUY STOP)" if d['Composite'] > 0 else "SHORT (SELL STOP)"
-    
     sqz_txt = "🚨 SQUEEZE DETECTED" if d.get('Squeeze_15m') else "Normal"
 
     return f"""
-**{i}. {d['Symbol']}** (Live Price: {d['Price']})
+**{i}. {d['Symbol']}** (Live: {d['Price']})
 - Kecenderungan: {action} | Skor: {d['Composite']} ({d['Matrix_Sync']})
-- Trend 1H (Macro): {d['Trend_1h']} | RSI 15m: {d['RSI_15m']} 
-- Struktur 15m: Support di {d['Swing_Low_15m']}, Resistance di {d['Swing_High_15m']}
-- Volatilitas 15m: {sqz_txt}
+- Trend 1H (Macro): {d['Trend_1h']} | Volatilitas 15m: {sqz_txt}
 - Anomali Whale 5m: {d['Whale_5m']} (Volume Z-score: {d['z_score_5m']}) 
-- Rencana BREAKOUT LONG → Entry (Buy Stop): {d['Buy_Stop']} | SL: {d['SL_Long']} | TP1: {d['TP1_Long']} | TP2: {d['TP2_Long']}
-- Rencana BREAKOUT SHORT → Entry (Sell Stop): {d['Sell_Stop']} | SL: {d['SL_Short']} | TP1: {d['TP1_Short']} | TP2: {d['TP2_Short']}"""
+- Rencana LONG (Buy Stop): {d['Buy_Stop']} | SL: {d['SL_Long']} | Qty/Amount: {d['Qty_Long']} koin
+- Rencana SHORT (Sell Stop): {d['Sell_Stop']} | SL: {d['SL_Short']} | Qty/Amount: {d['Qty_Short']} koin
+(Data Qty dihitung untuk meresikokan tepat ${FIXED_RISK_USD})"""
 
 async def ask_ai_agent(data_list: list) -> str:
     if not data_list: return "⚠️ Scan gagal."
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_KEY}"
     narratives = "\n".join([format_coin_for_prompt(i, d) for i, d in enumerate(data_list, 1)])
     
-    prompt = f"""Kamu adalah AI Intraday Breakout Trader Profesional. Berikut 12 koin hasil scan "God Mode v4.0 Intraday Breakout":
+    prompt = f"""Kamu adalah AI Intraday Breakout Trader Profesional. Berikut 12 koin hasil scan "God Mode v4.2 Final":
 {narratives}
 
-TUGASMU: Pilih TEPAT 5 KOIN TERBAIK untuk setup Breakout (Hold intraday berjam-jam hingga 1 hari).
+TUGASMU: Pilih TEPAT 5 KOIN TERBAIK untuk setup Breakout (Hold intraday).
 
-KRITERIA BREAKOUT PRIORITAS:
-1. SQUEEZE + WHALE: Cari koin dengan "SQUEEZE DETECTED" (volatilitas mampat) yang diiringi "NUCLEAR (WHALE)". Ini adalah indikasi kuat harga akan segera Breakout.
-2. ALIGNMENT: Arah Breakout harus searah dengan Trend 1H (Macro).
-3. STRATEGI SET & FORGET: Selalu gunakan rekomendasi harga (Buy Stop / Sell Stop) yang diberikan. Jangan gunakan Limit Order. Kita ingin masuk hanya jika harga berhasil menembus Resistance/Support.
+KRITERIA PRIORITAS:
+1. SQUEEZE + WHALE: Cari "SQUEEZE DETECTED" yang diiringi "NUCLEAR".
+2. ALIGNMENT: Arah Breakout harus searah Trend 1H.
 
-ATURAN FORMAT PENULISAN (PENTING!):
+ATURAN FORMAT PENULISAN:
 - Jangan gunakan karakter garis bawah (_) di luar format Markdown. 
 - Pastikan semua tanda bintang (*) selalu berpasangan.
 
 FORMAT WAJIB:
 ### [Nomor]. [NAMA KOIN] — [LONG / SHORT]
-**Konfluensi:** [Sebutkan alasan kuat Breakout, misal: "Trend 1H UPTREND + Squeeze 15m + Whale 5m masuk"]
-**Entry Order:** [Tuliskan "BUY STOP di (Harga)" atau "SELL STOP di (Harga)"] 
-**Stop Loss:** [Harga] _(Alasan: misal di bawah Swing Low)_
+**Konfluensi:** [Alasan kuat Breakout]
+**Entry Order:** [Tulis "BUY STOP di (Harga)" atau "SELL STOP di (Harga)"] 
+**Amount (Kuantitas):** [Isi dengan data Qty/Amount koin] _(Risk Fixed ${FIXED_RISK_USD})_
+**Stop Loss:** [Harga] 
 **TP1:** [Harga] | **TP2:** [Harga]
-**Risk/Reward:** [Rasio X:Y]
-**🚩 Red Flag Invalidasi:** [Kondisi yang membuat setup dibatalkan sebelum tersentuh]
+**🚩 Red Flag Invalidasi:** [Kondisi setup dibatalkan]
 """
     async with aiohttp.ClientSession() as session:
         for attempt in range(1, MAX_RETRIES + 1):
             try:
+                # BUG FIX: Ensure the timeout parameter is respected and we catch the response properly
                 async with session.post(url, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=60) as resp:
                     if resp.status == 200: return (await resp.json())['candidates'][0]['content']['parts'][0]['text']
-            except: pass
+            except Exception as e: logging.warning(f"Gemini attempt {attempt} failed: {e}")
             await asyncio.sleep(RETRY_DELAY)
     return "⚠️ Gemini API Error."
 
 async def main():
     if not all([GEMINI_KEY, TG_TOKEN, TG_CHAT_ID]): return
-    hdr = f"🌪️ *GOD MODE v4.0 — INTRADAY BREAKOUT*\n🕐 {datetime.now().strftime('%H:%M WIB')} | TF: 1H+15m+5m | Buy/Sell Stop Method\n{'─' * 46}\n\n"
+    hdr = f"👑 *GOD MODE v4.2 — ULTIMATE FINAL*\n🕐 {datetime.now().strftime('%H:%M WIB')} | Breakout & Fixed Risk ${FIXED_RISK_USD}\n{'─' * 46}\n\n"
     try:
         data = await get_high_precision_data()
         await send_to_telegram(await ask_ai_agent(data), header=hdr)
