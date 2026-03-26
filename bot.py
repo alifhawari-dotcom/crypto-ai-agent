@@ -19,7 +19,10 @@ TG_TOKEN   = os.getenv('TELEGRAM_TOKEN')
 TG_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
 # ============================================================
-# CONSTANTS (V5.3 — BULLETPROOF FINAL)
+# CONSTANTS (V5.4 — INTRADAY SNIPER)
+# Perubahan dari v5.3:
+#   MAX_RISK_PCT  : 15.0 → 7.0  (sweet spot intraday; filter JST-type)
+#   MIN_VOLUME_USD: ditambah    (eliminasi micro-cap pump di source)
 # ============================================================
 
 # ── Gemini Model Switcher (Anti 429) ─────────────────────────
@@ -35,12 +38,18 @@ RANKED_CANDIDATES   = 10
 CANDLES_REQUIRED    = 100
 
 # ── Risk Management ──────────────────────────────────────────
-FIXED_RISK_USD = 3.50   # Risiko per trade dalam USD — ubah sesuai modal
+FIXED_RISK_USD = 3.00   # Risiko per trade dalam USD — ubah sesuai modal
 RR_TP1         = 2.0    # R:R TP1 (Pine Script standard: 1:2)
 RR_TP2         = 3.5    # R:R TP2 (extended target: 1:3.5)
 SL_ATR_BUFFER  = 0.5    # Buffer SL di balik swing — anti liquidity sweep/stop hunt
-QTY_MAX_CAP    = 99999  # Safety cap qty untuk altcoin harga sangat kecil
-MAX_RISK_PCT   = 15.0   # Batalkan setup jika SL > 15% dari entry (setup tidak layak)
+QTY_MAX_CAP    = 99999        # Safety cap qty untuk altcoin harga sangat kecil
+MAX_RISK_PCT   = 7.0          # Batalkan setup jika SL > 7% dari entry
+                              # — sweet spot intraday: filter JST-type (12% SL) tanpa
+                              #   membuang koin liquid yang SL-nya memang 5-7% karena ATR normal.
+                              #   (5% terlalu ketat: kena noise; 15% terlalu longgar: buka swing trade)
+MIN_VOLUME_USD = 50_000_000   # $50 juta quoteVolume 24h minimum
+                              # — filter micro-cap pump sebelum masuk pipeline.
+                              #   JST di screenshot punya turnover $3.61M — tidak akan lolos.
 
 # ── Timeframes ───────────────────────────────────────────────
 TF_MACRO  = '1h'   # Trend anchor (patokan utama arah)
@@ -349,12 +358,20 @@ async def get_high_precision_data():
     exchange = ccxt.gate({'options': {'defaultType': 'swap'}, 'enableRateLimit': True})
     try:
         tickers = await exchange.fetch_tickers()
-        top     = sorted(
-            [v for v in tickers.values() if v.get('quoteVolume')],
-            key=lambda x: x['quoteVolume'], reverse=True
-        )[:TOP_COINS_BY_VOLUME]
 
-        logging.info(f"Fase 1: scan {len(top)} koin @ {TF_STRUCT}...")
+        # ── Filter 1: volume minimum — buang micro-cap pump sebelum masuk pipeline ──
+        # Koin seperti JST (turnover $3.61M) tidak akan pernah lolos sampai kalkulasi SL.
+        # Lebih efisien daripada mengandalkan MAX_RISK_PCT sebagai satu-satunya penjaga.
+        liquid = [
+            v for v in tickers.values()
+            if v.get('quoteVolume', 0) >= MIN_VOLUME_USD
+        ]
+        top = sorted(liquid, key=lambda x: x['quoteVolume'], reverse=True)[:TOP_COINS_BY_VOLUME]
+
+        logging.info(
+            f"Fase 1: scan {len(top)} koin @ {TF_STRUCT} "
+            f"(filtered: {len(liquid)} liquid >= ${MIN_VOLUME_USD/1e6:.0f}M dari {len(tickers)} total)..."
+        )
         sem1 = asyncio.Semaphore(SEMAPHORE_P1)
         async def sp1(coin):
             async with sem1: return await phase1_scan(exchange, coin)
@@ -690,7 +707,7 @@ async def main():
 
     ts = datetime.now().strftime("%d %b %Y, %H:%M WIB")
 
-    logging.info("🚀 God Mode v5.3 dimulai...")
+    logging.info("🚀 God Mode v5.4 dimulai...")
 
     try:
         data = await get_high_precision_data()
@@ -711,9 +728,9 @@ async def main():
         )
 
         header = (
-            f"👑 *GOD MODE v5.3 — BULLETPROOF FINAL*\n"
+            f"👑 *GOD MODE v5.4 — INTRADAY SNIPER*\n"
             f"🕐 {ts} | 1H+15m+5m | Anti Stop-Hunt\n"
-            f"💰 Risk/trade: ${FIXED_RISK_USD} | R:R {RR_TP1}:{RR_TP2} | SL max: {MAX_RISK_PCT}%\n"
+            f"💰 Risk/trade: ${FIXED_RISK_USD} | R:R {RR_TP1}:{RR_TP2} | SL max: {MAX_RISK_PCT}% | Vol min: ${MIN_VOLUME_USD/1e6:.0f}M\n"
             f"📊 Scan: {len(data)} koin | ⚠️ Cancel: {n_cancel}\n"
             f"{'─' * 38}\n\n"
         )
