@@ -1,8 +1,10 @@
 name: Crypto AI Agent 2026
 
 on:
-  # Hanya menggunakan pemicu manual / API eksternal
-  # Jadwal cron bawaan GitHub sudah dihapus agar tidak bentrok
+  # Berjalan otomatis setiap jam (agar irit kuota Gemini)
+  schedule:
+    - cron: '0 * * * *'
+  # Memungkinkan pemicu manual dari tab Actions
   workflow_dispatch:
 
 jobs:
@@ -18,7 +20,6 @@ jobs:
           python-version: '3.11'
           
       - name: Install dependencies
-        # Pastikan pandas dan numpy tetap ada untuk God Mode Matrix
         run: pip install ccxt aiohttp pandas numpy
         
       - name: Run Bot
@@ -27,3 +28,13 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python bot.py
+
+      # 🚀 BAGIAN KRUSIAL UNTUK MENYIMPAN JURNAL:
+      - name: Auto-Save Logs
+        run: |
+          git config --global user.name "Bot-Logger"
+          git config --global user.email "[email protected]"
+          # Cek jika ada perubahan pada file csv, jika ada maka commit dan push
+          git add trade_history.csv || echo "Belum ada file log."
+          git commit -m "Update trade history [skip ci]" || echo "Tidak ada perubahan data."
+          git push
