@@ -35,7 +35,7 @@ RANKED_CANDIDATES   = 10
 CANDLES_REQUIRED    = 100
 
 # ── Risk Management ──────────────────────────────────────────
-FIXED_RISK_USD = 1.50   # Risiko per trade dalam USD — ubah sesuai modal
+FIXED_RISK_USD = 3.50   # Risiko per trade dalam USD — ubah sesuai modal
 RR_TP1         = 2.0    # R:R TP1 (Pine Script standard: 1:2)
 RR_TP2         = 3.5    # R:R TP2 (extended target: 1:3.5)
 SL_ATR_BUFFER  = 0.5    # Buffer SL di balik swing — anti liquidity sweep/stop hunt
