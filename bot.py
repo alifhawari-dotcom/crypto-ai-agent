@@ -1,8 +1,8 @@
 import os
+import re
+import json
 import asyncio
 import logging
-import json
-import re
 import aiohttp
 import ccxt.async_support as ccxt
 import pandas as pd
@@ -19,30 +19,33 @@ TG_TOKEN   = os.getenv('TELEGRAM_TOKEN')
 TG_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
 # ============================================================
-# CONSTANTS (V5.2 — BULLETPROOF JSON + GUARDRAILS)
+# CONSTANTS (V5.3 — BULLETPROOF FINAL)
 # ============================================================
 
+# ── Gemini Model Switcher (Anti 429) ─────────────────────────
 GEMINI_MODELS = [
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
-    "gemini-1.5-flash-8b",
+    "gemini-2.5-flash",    # Utama — terbaru, paling pintar
+    "gemini-2.0-flash",    # Fallback 1
+    "gemini-1.5-flash",    # Fallback 2
+    "gemini-1.5-flash-8b", # Fallback 3 — paling ringan, paling toleran kuota
 ]
 
 TOP_COINS_BY_VOLUME = 40
 RANKED_CANDIDATES   = 10
 CANDLES_REQUIRED    = 100
 
-FIXED_RISK_USD  = 1.50
-RR_TP1          = 2.0
-RR_TP2          = 3.5
-SL_ATR_BUFFER   = 0.5
-QTY_MAX_CAP     = 99999
-MAX_RISK_PCT    = 15.0   # Koin dibatalkan jika SL > 15% dari entry
+# ── Risk Management ──────────────────────────────────────────
+FIXED_RISK_USD = 1.50   # Risiko per trade dalam USD — ubah sesuai modal
+RR_TP1         = 2.0    # R:R TP1 (Pine Script standard: 1:2)
+RR_TP2         = 3.5    # R:R TP2 (extended target: 1:3.5)
+SL_ATR_BUFFER  = 0.5    # Buffer SL di balik swing — anti liquidity sweep/stop hunt
+QTY_MAX_CAP    = 99999  # Safety cap qty untuk altcoin harga sangat kecil
+MAX_RISK_PCT   = 15.0   # Batalkan setup jika SL > 15% dari entry (setup tidak layak)
 
-TF_MACRO  = '1h'
-TF_STRUCT = '15m'
-TF_MICRO  = '5m'
+# ── Timeframes ───────────────────────────────────────────────
+TF_MACRO  = '1h'   # Trend anchor (patokan utama arah)
+TF_STRUCT = '15m'  # Swing level + entry trigger
+TF_MICRO  = '5m'   # Whale/volume anomaly real-time
 
 ATR_PERIOD, RSI_PERIOD = 14, 14
 EMA_FAST,   EMA_SLOW   = 20, 50
@@ -54,13 +57,17 @@ PHASE2_DELAY = 0.3
 MAX_RETRIES  = 3
 RETRY_DELAY  = 5
 
+# ── Position Logger ──────────────────────────────────────────
+LOG_FILE = "trade_history.csv"
+
 # ============================================================
-# INDIKATOR
+# INDIKATOR — SAMA PERSIS DENGAN v4.5
 # ============================================================
 
 def calc_atr(df: pd.DataFrame, period: int = ATR_PERIOD) -> pd.Series:
+    """ATR dengan anomaly filter: TR spike >4× median tidak merusak SL."""
     high, low, pc = df['high'], df['low'], df['close'].shift(1)
-    tr = pd.concat([high-low, (high-pc).abs(), (low-pc).abs()], axis=1).max(axis=1)
+    tr     = pd.concat([high-low, (high-pc).abs(), (low-pc).abs()], axis=1).max(axis=1)
     median = tr.rolling(50, min_periods=1).median()
     clean  = pd.Series(np.where(tr > median * 4, median, tr), index=df.index)
     return clean.rolling(period).mean()
@@ -84,9 +91,9 @@ def calc_macd(close: pd.Series):
 
 
 def calc_squeeze(df: pd.DataFrame, atr: pd.Series) -> pd.Series:
-    c  = df['close']
-    s  = c.rolling(20).mean()
-    sd = c.rolling(20).std()
+    """BB masuk KC = volatilitas dimampatkan → breakout imminent."""
+    c, sd = df['close'], df['close'].rolling(20).std()
+    s     = df['close'].rolling(20).mean()
     return (s + 2*sd < s + 1.5*atr) & (s - 2*sd > s - 1.5*atr)
 
 
@@ -106,6 +113,7 @@ def _find_swings(highs, lows, lookback: int):
 
 
 def calc_swing_levels(df: pd.DataFrame, lookback: int = SWING_LOOKBACK) -> dict:
+    """Adaptive fallback — tidak pernah return None."""
     highs, lows = df['high'].values, df['low'].values
     sh, sl = [], []
     for lb in range(lookback, 2, -1):
@@ -120,6 +128,7 @@ def calc_swing_levels(df: pd.DataFrame, lookback: int = SWING_LOOKBACK) -> dict:
 
 
 def detect_smart_money(z: float, squeeze: bool) -> dict:
+    """Tier smart money dari Z-score volume + squeeze."""
     if z > 3.0:   level, bonus = "NUCLEAR", 15
     elif z > 1.5: level, bonus = "ACTIVE",  7
     else:         level, bonus = "QUIET",   0
@@ -137,6 +146,7 @@ def detect_smart_money(z: float, squeeze: bool) -> dict:
 # ============================================================
 
 async def fetch_ohlcv_safe(exchange, symbol: str, tf: str, limit: int):
+    """Fetch dengan hard timeout 10s + validasi jumlah candle."""
     try:
         data = await asyncio.wait_for(
             exchange.fetch_ohlcv(symbol, tf, limit=limit), timeout=10.0
@@ -152,17 +162,17 @@ async def fetch_ohlcv_safe(exchange, symbol: str, tf: str, limit: int):
 
 def build_indicators(df: pd.DataFrame) -> dict:
     c, h, l, v = df['close'], df['high'], df['low'], df['volume']
-    atr  = calc_atr(df)
-    rng  = h - l
-    nd   = pd.Series(np.where(rng==0, 0, ((c-l)-(h-c))/rng*v), index=df.index)
-    ad   = nd.abs().rolling(20).mean()
-    sf   = np.clip((nd / np.where(ad==0, 1, ad)) * 20, -40, 40)
-    rsi  = calc_rsi(c)
-    ps   = sf + np.clip((rsi-50)*1.2, -30, 30)
-    sw   = calc_swing_levels(df)
-    vm   = v.rolling(20).mean().iloc[-1]
-    vs   = v.rolling(20).std().iloc[-1]
-    z    = float((v.iloc[-1]-vm) / (vs if vs != 0 else 1))
+    atr = calc_atr(df)
+    rng = h - l
+    nd  = pd.Series(np.where(rng==0, 0, ((c-l)-(h-c))/rng*v), index=df.index)
+    ad  = nd.abs().rolling(20).mean()
+    sf  = np.clip((nd / np.where(ad==0, 1, ad)) * 20, -40, 40)
+    rsi = calc_rsi(c)
+    ps  = sf + np.clip((rsi-50)*1.2, -30, 30)
+    sw  = calc_swing_levels(df)
+    vm  = v.rolling(20).mean().iloc[-1]
+    vs  = v.rolling(20).std().iloc[-1]
+    z   = float((v.iloc[-1]-vm) / (vs if vs != 0 else 1))
     return {
         'close':        float(c.iloc[-1]),
         'power_score':  round(float(ps.iloc[-1]), 1),
@@ -179,6 +189,7 @@ def build_indicators(df: pd.DataFrame) -> dict:
 
 
 async def phase1_scan(exchange, coin: dict) -> dict | None:
+    """Fase 1: Scan 15m — momentum awal + swing level."""
     symbol = coin['symbol']
     df     = await fetch_ohlcv_safe(exchange, symbol, TF_STRUCT, CANDLES_REQUIRED)
     if df is None:
@@ -198,6 +209,7 @@ async def phase1_scan(exchange, coin: dict) -> dict | None:
 
 
 async def phase2_enrich(exchange, c: dict) -> dict:
+    """Fase 2: Enrichment paralel 1H (trend) + 5m (whale)."""
     symbol = c['symbol']
     await asyncio.sleep(PHASE2_DELAY)
     df_1h, df_5m = await asyncio.gather(
@@ -234,6 +246,11 @@ def format_qty(qty: float) -> float:
 
 
 def finalize_candidate(c: dict) -> dict:
+    """
+    Composite Score + Pine Script SL/TP + 2 guardrail:
+    1. Anti TP minus (TP short diklem minimal 1% dari entry)
+    2. Batalkan jika SL > MAX_RISK_PCT% dari entry
+    """
     p15 = c['power_15m']
     p1h = c.get('power_1h', p15)
     p5m = c.get('power_5m', p15)
@@ -260,55 +277,59 @@ def finalize_candidate(c: dict) -> dict:
                         "NEUTRAL")
     c['Aligned'] = aligned
 
-    price   = c['Price']
-    atr     = c['ATR_15m']
-    sh      = c['Swing_High_15m']
-    sl_val  = c['Swing_Low_15m']
+    price  = c['Price']
+    atr    = c['ATR_15m']
+    sh     = c['Swing_High_15m']
+    sl_val = c['Swing_Low_15m']
 
-    buy_stop  = round(sh * 1.001, 6) if sh > price else round(price + atr * 0.2, 6)
+    # Entry: Buy/Sell Stop di Swing Level (breakout confirmation)
+    buy_stop  = round(sh    * 1.001, 6) if sh    > price else round(price + atr * 0.2, 6)
     sell_stop = round(sl_val * 0.999, 6) if sl_val < price else round(price - atr * 0.2, 6)
 
+    # SL: di balik swing + buffer 0.5×ATR (Pine Script anti stop-hunt)
     sl_long  = round(sl_val - atr * SL_ATR_BUFFER, 6)
     sl_short = round(sh     + atr * SL_ATR_BUFFER, 6)
 
     rl = max(buy_stop  - sl_long,  1e-9)
     rs = max(sl_short  - sell_stop, 1e-9)
 
-    # ── GUARDRAIL 1: Anti TP Minus ────────────────────────────
-    # TP short tidak boleh ≤ 0. Diklem di minimal 1% dari sell_stop.
+    # ── Guardrail 1: Anti TP Minus ────────────────────────────
     tp1_long  = round(buy_stop  + rl * RR_TP1, 6)
     tp2_long  = round(buy_stop  + rl * RR_TP2, 6)
     tp1_short = round(max(sell_stop - rs * RR_TP1, sell_stop * 0.01), 6)
     tp2_short = round(max(sell_stop - rs * RR_TP2, sell_stop * 0.01), 6)
 
-    # ── GUARDRAIL 2: Batalkan koin jika SL terlalu lebar ─────
-    # Risk > MAX_RISK_PCT% dari entry = setup tidak layak
-    risk_pct_long  = (rl / buy_stop)   * 100
-    risk_pct_short = (rs / sell_stop)  * 100
+    # ── Guardrail 2: SL terlalu lebar = batalkan ──────────────
+    risk_pct_long  = round((rl / buy_stop)  * 100, 1)
+    risk_pct_short = round((rs / sell_stop) * 100, 1)
     wild_long  = risk_pct_long  > MAX_RISK_PCT
     wild_short = risk_pct_short > MAX_RISK_PCT
 
     if wild_long:
-        logging.debug(f"{c['Symbol']} LONG risk {risk_pct_long:.1f}% > {MAX_RISK_PCT}% → CANCEL")
+        logging.debug(f"{c['Symbol']} LONG risk {risk_pct_long}% > {MAX_RISK_PCT}% → CANCEL")
     if wild_short:
-        logging.debug(f"{c['Symbol']} SHORT risk {risk_pct_short:.1f}% > {MAX_RISK_PCT}% → CANCEL")
+        logging.debug(f"{c['Symbol']} SHORT risk {risk_pct_short}% > {MAX_RISK_PCT}% → CANCEL")
 
     c.update({
-        'Buy_Stop':    buy_stop,
-        'SL_Long':     sl_long,
-        'TP1_Long':    tp1_long,
-        'TP2_Long':    tp2_long,
-        'Qty_Long':    format_qty(FIXED_RISK_USD / rl),
-        'Sell_Stop':   sell_stop,
-        'SL_Short':    sl_short,
-        'TP1_Short':   tp1_short,
-        'TP2_Short':   tp2_short,
-        'Qty_Short':   format_qty(FIXED_RISK_USD / rs),
-        # Cancel jika: counter-trend 1H ATAU SL terlalu lebar
-        'Cancel_Long':  (trend == 'DOWNTREND') or wild_long,
-        'Cancel_Short': (trend == 'UPTREND')   or wild_short,
-        'Risk_Pct_Long':  round(risk_pct_long, 1),
-        'Risk_Pct_Short': round(risk_pct_short, 1),
+        'Buy_Stop':       buy_stop,
+        'SL_Long':        sl_long,
+        'TP1_Long':       tp1_long,
+        'TP2_Long':       tp2_long,
+        'Qty_Long':       format_qty(FIXED_RISK_USD / rl),
+        'Risk_Pct_Long':  risk_pct_long,
+
+        'Sell_Stop':      sell_stop,
+        'SL_Short':       sl_short,
+        'TP1_Short':      tp1_short,
+        'TP2_Short':      tp2_short,
+        'Qty_Short':      format_qty(FIXED_RISK_USD / rs),
+        'Risk_Pct_Short': risk_pct_short,
+
+        # Cancel jika: counter-trend ATAU SL terlalu lebar
+        'Cancel_Long':    (trend == 'DOWNTREND') or wild_long,
+        'Cancel_Short':   (trend == 'UPTREND')   or wild_short,
+        'Wild_Long':      wild_long,
+        'Wild_Short':     wild_short,
     })
     return c
 
@@ -342,46 +363,164 @@ async def get_high_precision_data():
 
 
 # ============================================================
-# GEMINI — SINGLE CALL + BULLETPROOF PARSER
-#
-# Root cause error v5.1 di produksi:
-#   AI mengembalikan: "picks": "A", "B", "C", "D"
-#   (lupa kurung siku → JSONDecodeError → fallback total → teks mentah
-#    tercetak ke Telegram + kartu mengabaikan pilihan AI)
-#
-# Fix di v5.2:
-#   1. Prompt lebih eksplisit — contoh format picks dengan kurung siku
-#   2. Parser berlapis 5 level — level baru: ekstrasi simbol
-#      dari string tanpa kurung siku (persis penyebab bug produksi)
-#   3. Guardrail anti-TP minus & SL lebar sudah di finalize_candidate
-#   4. Fallback teks mentah TIDAK dikirim ke Telegram jika picks valid
+# POSITION LOGGER — "Buku Harian Sniper"
+# Catat setiap sinyal ke trade_history.csv untuk evaluasi
+# mingguan/bulanan. File di-commit oleh GitHub Actions.
 # ============================================================
 
-_PROMPT_TEMPLATE = """\
+def log_positions(selected_data: list):
+    """
+    Catat koin terpilih ke LOG_FILE (CSV).
+    Buat header jika file belum ada, append jika sudah ada.
+    """
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    if not os.path.exists(LOG_FILE):
+        with open(LOG_FILE, "w") as f:
+            f.write("Time,Symbol,Action,Entry,SL,TP1,TP2,Qty,Risk_Pct,Score,SM_Signal,Trend_1H,Aligned\n")
+
+    with open(LOG_FILE, "a") as f:
+        for d in selected_data:
+            act   = "LONG" if d['Composite'] > 0 else "SHORT"
+            entry = d['Buy_Stop']  if act == "LONG" else d['Sell_Stop']
+            sl    = d['SL_Long']   if act == "LONG" else d['SL_Short']
+            tp1   = d['TP1_Long']  if act == "LONG" else d['TP1_Short']
+            tp2   = d['TP2_Long']  if act == "LONG" else d['TP2_Short']
+            qty   = d['Qty_Long']  if act == "LONG" else d['Qty_Short']
+            rp    = d.get('Risk_Pct_Long') if act == "LONG" else d.get('Risk_Pct_Short')
+            aln   = "YES" if d.get('Aligned') else "NO"
+            f.write(
+                f"{ts},{d['Symbol']},{act},{entry},{sl},{tp1},{tp2},"
+                f"{qty},{rp},{d['Composite']},{d['SM_Signal']},"
+                f"{d.get('Trend_1h','N/A')},{aln}\n"
+            )
+
+    logging.info(f"✅ {len(selected_data)} posisi dicatat di {LOG_FILE}")
+
+
+# ============================================================
+# GEMINI — MODEL SWITCHER + BULLETPROOF JSON PARSER
+#
+# Root cause bug produksi (v5.1):
+#   AI mengembalikan "picks": "A","B","C" (tanpa kurung siku [ ])
+#   → JSONDecodeError → fallback total → teks mentah ke Telegram
+#   → kartu trade tidak konsisten dengan narasi AI
+#
+# Fix v5.3:
+#   Parser 5 level — tahan semua variasi format rusak dari AI
+#   Satu panggilan Gemini → narasi + picks dari sumber yang sama
+#   Fallback total kirim pesan bersih, BUKAN teks JSON mentah
+# ============================================================
+
+_PROMPT = """\
 Kamu AI Intraday Breakout Trader. Dari data berikut, pilih TEPAT 4 koin terbaik.
-WAJIB ABAIKAN koin bertanda ⚠️CANCEL.
-Prioritas: SM=NUCLEAR/NUC+SQZ > 3TF=✅ > Trend 1H searah aksi.
+WAJIB ABAIKAN koin bertanda CANCEL.
+Prioritas: SM=NUCLEAR/NUC+SQZ > 3TF=YES > Trend 1H searah aksi.
 
 {rows}
 
-FORMAT BALASAN — HANYA JSON VALID, TANPA TEKS LAIN, TANPA MARKDOWN FENCE:
+FORMAT BALASAN: HANYA JSON VALID, TANPA TEKS LAIN, TANPA MARKDOWN FENCE.
 {{
-  "analysis": "### 1. NAMA — LONG\\n**Konfluensi:** ...\\n**Entry:** BUY STOP di HARGA | **Qty:** QTY _(Risk ${risk})_\\n**SL:** HARGA | **TP1:** HARGA | **TP2:** HARGA\\n**🚩 Cancel jika:** ...\\n---\\n### 2. ...",
+  "analysis": "### 1. NAMA - LONG\\n**Konfluensi:** 1 kalimat\\n**Entry:** BUY STOP di HARGA | **Qty:** QTY (Risk ${risk})\\n**SL:** HARGA | **TP1:** HARGA | **TP2:** HARGA\\n**Cancel jika:** kondisi\\n---\\n### 2. ...",
   "picks": ["SYMBOL_1", "SYMBOL_2", "SYMBOL_3", "SYMBOL_4"]
 }}
 
 ATURAN WAJIB:
-- "picks" HARUS berupa array dengan KURUNG SIKU [ ] — contoh: ["BTC/USDT:USDT","ETH/USDT:USDT"]
-- Isi "picks" HARUS SAMA PERSIS dengan simbol di kolom symbol: pada data
-- Koin di "analysis" dan "picks" HARUS IDENTIK
-- TP tidak boleh bernilai negatif atau nol
+- picks HARUS array kurung siku [ ] contoh: ["BTC/USDT:USDT","ETH/USDT:USDT"]
+- picks HARUS simbol persis dari kolom symbol: di data
+- TP tidak boleh negatif atau nol
 """
+
+
+def _extract_analysis_field(text: str) -> str:
+    """Ekstrak nilai field 'analysis' dari JSON setengah-valid."""
+    m = re.search(r'"analysis"\s*:\s*"((?:[^"\\]|\\.)*)"', text, re.DOTALL)
+    if m:
+        try:
+            return bytes(m.group(1), 'utf-8').decode('unicode_escape')
+        except Exception:
+            return m.group(1).replace('\\n', '\n').replace('\\"', '"')
+    return ""
+
+
+def _parse_ai_response(raw: str, data_list: list) -> tuple[str, list[str]]:
+    """
+    Parser berlapis 5 level — tahan berbagai format rusak dari AI.
+
+    L1: json.loads normal
+    L2: regex cari blok {...} pertama
+    L3: regex ekstrak "picks": [...]
+    L4: regex ekstrak "picks": "a","b" (tanpa kurung siku ← root cause bug)
+    L5: scan seluruh teks untuk simbol valid
+    Fallback total → pesan bersih + data[:4]
+    """
+    valid  = {d['symbol'] for d in data_list}
+    clean  = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw.strip(), flags=re.MULTILINE).strip()
+
+    def validate(candidates: list) -> list:
+        return [s.strip() for s in candidates if s.strip() in valid][:4]
+
+    # Level 1: parse normal
+    try:
+        obj   = json.loads(clean)
+        picks = validate(obj.get('picks', []))
+        if picks:
+            logging.info(f"[Parser L1] {picks}")
+            return str(obj.get('analysis', '')).strip() or raw, picks
+    except Exception:
+        pass
+
+    # Level 2: cari blok {...}
+    m = re.search(r'\{.*\}', clean, re.DOTALL)
+    if m:
+        try:
+            obj   = json.loads(m.group())
+            picks = validate(obj.get('picks', []))
+            if picks:
+                logging.warning(f"[Parser L2] {picks}")
+                return str(obj.get('analysis', '')).strip() or raw, picks
+        except Exception:
+            pass
+
+    # Level 3: "picks": ["a","b"]
+    m = re.search(r'"picks"\s*:\s*\[([^\]]*)\]', clean, re.DOTALL)
+    if m:
+        picks = validate(re.findall(r'"([^"]+)"', m.group(1)))
+        if picks:
+            logging.warning(f"[Parser L3] {picks}")
+            return _extract_analysis_field(clean) or raw, picks
+
+    # Level 4: "picks": "a","b" — root cause bug produksi
+    m = re.search(r'"picks"\s*:\s*"', clean)
+    if m:
+        region = clean[m.start():]
+        found  = re.findall(r'"([A-Z0-9]+/USDT(?::USDT)?)"', region[:400])
+        picks  = validate(found)
+        if picks:
+            logging.warning(f"[Parser L4 — root cause fixed] {picks}")
+            return _extract_analysis_field(clean) or raw, picks
+
+    # Level 5: scan seluruh teks
+    found = re.findall(r'\b([A-Z]{2,10}/USDT(?::USDT)?)\b', raw)
+    picks = validate(list(dict.fromkeys(found)))
+    if picks:
+        logging.warning(f"[Parser L5] {picks}")
+        return _extract_analysis_field(clean) or raw, picks
+
+    # Fallback total
+    logging.error("[Parser] Semua level gagal — fallback data[:4]")
+    return (
+        "⚠️ *AI tidak dapat memformat respons.*\n"
+        "Bot otomatis memilih 4 koin teratas berdasarkan Composite Score.\n"
+        "_Kartu di bawah dari data mentah, bukan pilihan AI._",
+        [d['symbol'] for d in data_list[:4]]
+    )
 
 
 async def ask_ai_agent(data_list: list) -> tuple[str, list[str]]:
     """
-    Satu panggilan Gemini → (narasi_markdown, [simbol_pilihan_AI]).
-    Narasi dan picks berasal dari respons yang sama → tidak bisa inkonsisten.
+    Satu panggilan Gemini → (narasi_markdown, [simbol_pilihan]).
+    Narasi dan picks dari respons yang sama → selalu konsisten.
     """
     if not data_list:
         return "⚠️ Data kosong.", []
@@ -389,21 +528,20 @@ async def ask_ai_agent(data_list: list) -> tuple[str, list[str]]:
     rows = []
     for d in data_list:
         act  = "LONG" if d['Composite'] > 0 else "SHORT"
-        cncl = " ⚠️CANCEL" if (act=="LONG" and d['Cancel_Long']) or (act=="SHORT" and d['Cancel_Short']) else ""
+        cncl = " CANCEL" if (act=="LONG" and d['Cancel_Long']) or (act=="SHORT" and d['Cancel_Short']) else ""
+        entry_str = f"BUY@{d['Buy_Stop']}"  if act == "LONG" else f"SELL@{d['Sell_Stop']}"
+        sl_str    = str(d['SL_Long'])        if act == "LONG" else str(d['SL_Short'])
+        tp1_str   = str(d['TP1_Long'])       if act == "LONG" else str(d['TP1_Short'])
+        tp2_str   = str(d['TP2_Long'])       if act == "LONG" else str(d['TP2_Short'])
+        qty_str   = str(d['Qty_Long'])       if act == "LONG" else str(d['Qty_Short'])
+        rp_str    = str(d['Risk_Pct_Long'])  if act == "LONG" else str(d['Risk_Pct_Short'])
         rows.append(
             f"symbol:{d['symbol']}|{act}{cncl}|Score:{d['Composite']}({d['Matrix_Sync']})|"
-            f"1H:{d['Trend_1h']}|SM:{d['SM_Signal']}|3TF:{'✅' if d['Aligned'] else '❌'}|"
-            f"Entry:{'BUY@'+str(d['Buy_Stop']) if act=='LONG' else 'SELL@'+str(d['Sell_Stop'])}|"
-            f"SL:{d['SL_Long'] if act=='LONG' else d['SL_Short']}|"
-            f"TP1:{d['TP1_Long'] if act=='LONG' else d['TP1_Short']}|"
-            f"TP2:{d['TP2_Long'] if act=='LONG' else d['TP2_Short']}|"
-            f"Qty:{d['Qty_Long'] if act=='LONG' else d['Qty_Short']}"
+            f"1H:{d['Trend_1h']}|SM:{d['SM_Signal']}|3TF:{'YES' if d['Aligned'] else 'NO'}|"
+            f"{entry_str}|SL:{sl_str}|TP1:{tp1_str}|TP2:{tp2_str}|Qty:{qty_str}|Risk:{rp_str}%"
         )
 
-    prompt = _PROMPT_TEMPLATE.format(
-        rows="\n".join(rows),
-        risk=FIXED_RISK_USD
-    )
+    prompt = _PROMPT.format(rows="\n".join(rows), risk=FIXED_RISK_USD)
 
     async with aiohttp.ClientSession() as session:
         for model in GEMINI_MODELS:
@@ -432,122 +570,15 @@ async def ask_ai_agent(data_list: list) -> tuple[str, list[str]]:
     return "⚠️ Semua model Gemini kena limit. Coba lagi nanti.", []
 
 
-def _parse_ai_response(raw: str, data_list: list) -> tuple[str, list[str]]:
-    """
-    Parser berlapis 5 level — tahan terhadap berbagai format rusak dari AI.
-
-    Level 1: json.loads normal
-    Level 2: ekstrak blok {...} pertama dengan regex lalu json.loads
-    Level 3: ekstrak field "picks" array normal ["a","b"]
-    Level 4: ekstrak simbol dari "picks": "a","b","c" (tanpa kurung siku ← bug produksi)
-    Level 5: fallback regex nama koin dari teks bebas di seluruh respons
-    Jika semua gagal → fallback data[:4], log warning
-
-    Narasi selalu diambil dari field "analysis" jika tersedia.
-    Jika tidak, narasi = raw teks (HANYA jika picks berhasil ditemukan).
-    Jika semua gagal total, narasi = pesan error bersih (BUKAN teks JSON mentah).
-    """
-    valid_symbols = {d['symbol'] for d in data_list}
-
-    # Bersihkan markdown fence jika ada
-    clean = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw.strip(), flags=re.MULTILINE).strip()
-
-    def validate_picks(candidates: list) -> list:
-        """Filter picks ke simbol yang valid, maks 4."""
-        return [s.strip() for s in candidates if s.strip() in valid_symbols][:4]
-
-    # ── Level 1: json.loads normal ────────────────────────────
-    try:
-        obj      = json.loads(clean)
-        analysis = str(obj.get('analysis', '')).strip()
-        picks    = validate_picks(obj.get('picks', []))
-        if picks:
-            logging.info(f"[Parser L1] OK: {picks}")
-            return analysis or raw, picks
-    except (json.JSONDecodeError, ValueError, AttributeError):
-        pass
-
-    # ── Level 2: cari blok {...} pertama ─────────────────────
-    m = re.search(r'\{.*\}', clean, re.DOTALL)
-    if m:
-        try:
-            obj      = json.loads(m.group())
-            analysis = str(obj.get('analysis', '')).strip()
-            picks    = validate_picks(obj.get('picks', []))
-            if picks:
-                logging.warning(f"[Parser L2] regex block OK: {picks}")
-                return analysis or raw, picks
-        except (json.JSONDecodeError, ValueError):
-            pass
-
-    # ── Level 3: ekstrak "picks" array normal ─────────────────
-    # Menangkap: "picks": ["A", "B", "C"]
-    m = re.search(r'"picks"\s*:\s*\[([^\]]*)\]', clean, re.DOTALL)
-    if m:
-        found = re.findall(r'"([^"]+)"', m.group(1))
-        picks = validate_picks(found)
-        if picks:
-            logging.warning(f"[Parser L3] picks-array regex OK: {picks}")
-            # Coba ambil analysis dengan regex terpisah
-            analysis = _extract_analysis_field(clean)
-            return analysis or raw, picks
-
-    # ── Level 4: "picks" tanpa kurung siku ← ROOT CAUSE BUG PRODUKSI
-    # Menangkap: "picks": "A", "B", "C", "D"  (AI lupa [ ])
-    m = re.search(r'"picks"\s*:\s*"([^"]+)"(?:\s*,\s*"([^"]+)")*', clean)
-    if m:
-        # Ambil semua string setelah "picks": sampai akhir baris / field berikutnya
-        region = clean[m.start():]
-        found  = re.findall(r'"([A-Z0-9]+/USDT(?::USDT)?)"', region[:300])
-        picks  = validate_picks(found)
-        if picks:
-            logging.warning(f"[Parser L4] picks-no-bracket OK (root cause fix): {picks}")
-            analysis = _extract_analysis_field(clean)
-            return analysis or raw, picks
-
-    # ── Level 5: ekstrak nama koin dari seluruh teks ──────────
-    # Sabuk pengaman terakhir — selama AI menyebut nama koin, kita tangkap
-    all_symbols = re.findall(r'\b([A-Z]{2,10}/USDT(?::USDT)?)\b', raw)
-    picks = validate_picks(list(dict.fromkeys(all_symbols)))  # deduplicate
-    if picks:
-        logging.warning(f"[Parser L5] full-text symbol scan OK: {picks}")
-        analysis = _extract_analysis_field(clean)
-        return analysis or raw, picks
-
-    # ── Fallback total ────────────────────────────────────────
-    logging.error("[Parser] Semua level gagal — fallback ke data[:4]")
-    fallback_picks = [d['symbol'] for d in data_list[:4]]
-    # Kirim pesan error bersih — BUKAN teks JSON mentah
-    fallback_analysis = (
-        "⚠️ *AI tidak dapat memformat respons dengan benar.*\n"
-        "Bot otomatis memilih 4 koin teratas berdasarkan Composite Score.\n"
-        "_Kartu trade di bawah ini dibuat dari data mentah, bukan pilihan AI._"
-    )
-    return fallback_analysis, fallback_picks
-
-
-def _extract_analysis_field(text: str) -> str:
-    """Coba ekstrak nilai field 'analysis' dari teks JSON setengah-valid."""
-    # Cari "analysis": "..." (multiline, escaped)
-    m = re.search(r'"analysis"\s*:\s*"((?:[^"\\]|\\.)*)"', text, re.DOTALL)
-    if m:
-        # Unescape escape sequences dari JSON
-        try:
-            return bytes(m.group(1), 'utf-8').decode('unicode_escape')
-        except Exception:
-            return m.group(1).replace('\\n', '\n').replace('\\"', '"')
-    return ""
-
-
 # ============================================================
-# TELEGRAM
+# TELEGRAM — KARTU RINGKAS + HARGA BISA DICOPY
 # ============================================================
 
 def build_trade_message(d: dict, rank: int) -> str:
     """
-    Kartu trade per koin — tap-to-copy di Telegram.
-    Hanya dipanggil untuk koin yang sudah diverifikasi AI.
-    Risk % ditampilkan dari data nyata (bukan kalkulasi ulang).
+    Kartu trade per koin.
+    Harga dalam backtick → tap to copy di Telegram mobile & desktop.
+    Cancel reason spesifik (counter-trend vs SL terlalu lebar).
     """
     is_long    = d['Composite'] > 0
     act_emoji  = "🟢" if is_long else "🔴"
@@ -559,19 +590,18 @@ def build_trade_message(d: dict, rank: int) -> str:
     tp1      = d['TP1_Long']  if is_long else d['TP1_Short']
     tp2      = d['TP2_Long']  if is_long else d['TP2_Short']
     qty      = d['Qty_Long']  if is_long else d['Qty_Short']
-    risk_pct = d.get('Risk_Pct_Long') if is_long else d.get('Risk_Pct_Short')
-    risk_str = f"{risk_pct:.1f}%" if risk_pct is not None else "N/A"
+    risk_pct = d['Risk_Pct_Long'] if is_long else d['Risk_Pct_Short']
 
     align_badge = "✅ 3TF" if d.get('Aligned') else "⚡ 2TF"
     sqz_badge   = " 🔥SQZ" if d.get('Squeeze_15m') else ""
 
     cancel_warn = ""
     if is_long and d.get('Cancel_Long'):
-        reason = "SL terlalu lebar" if d.get('Risk_Pct_Long', 0) > MAX_RISK_PCT else "1H DOWNTREND"
-        cancel_warn = f"\n⚠️ *CANCEL* — {reason}!"
+        reason = f"SL terlalu lebar ({risk_pct}% > {MAX_RISK_PCT}%)" if d.get('Wild_Long') else "1H DOWNTREND"
+        cancel_warn = f"\n⚠️ *CANCEL* — {reason}"
     elif not is_long and d.get('Cancel_Short'):
-        reason = "SL terlalu lebar" if d.get('Risk_Pct_Short', 0) > MAX_RISK_PCT else "1H UPTREND"
-        cancel_warn = f"\n⚠️ *CANCEL* — {reason}!"
+        reason = f"SL terlalu lebar ({risk_pct}% > {MAX_RISK_PCT}%)" if d.get('Wild_Short') else "1H UPTREND"
+        cancel_warn = f"\n⚠️ *CANCEL* — {reason}"
 
     return (
         f"{act_emoji} *{rank}. {d['Symbol']} — {act_label}*  "
@@ -580,7 +610,7 @@ def build_trade_message(d: dict, rank: int) -> str:
         f"{'─' * 28}\n"
         f"📌 *{entry_type}*\n"
         f"  Entry : `{entry}`\n"
-        f"  SL    : `{sl}`  _(-{risk_str})_\n"
+        f"  SL    : `{sl}`  _(-{risk_pct}%)_\n"
         f"  TP1   : `{tp1}`  _(R:R 1:{RR_TP1})_\n"
         f"  TP2   : `{tp2}`  _(R:R 1:{RR_TP2})_\n"
         f"  Qty   : `{qty}` koin  _(Risk ~${FIXED_RISK_USD})_"
@@ -589,7 +619,7 @@ def build_trade_message(d: dict, rank: int) -> str:
 
 
 async def _tg_post(session: aiohttp.ClientSession, payload: dict) -> bool:
-    """Kirim satu pesan Telegram dengan retry + fallback plain text."""
+    """Post satu pesan Telegram dengan retry + fallback plain text."""
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -598,7 +628,6 @@ async def _tg_post(session: aiohttp.ClientSession, payload: dict) -> bool:
                 if resp.status == 200:
                     return True
                 if resp.status == 400 and "parse_mode" in payload:
-                    # Markdown error → kirim ulang tanpa formatting
                     plain = {k: v for k, v in payload.items() if k != "parse_mode"}
                     async with session.post(url, json=plain) as r2:
                         return r2.status == 200
@@ -611,7 +640,7 @@ async def _tg_post(session: aiohttp.ClientSession, payload: dict) -> bool:
 
 
 async def send_to_telegram(text: str, header: str = ""):
-    """Kirim analisis naratif AI (chunked jika >4000 karakter)."""
+    """Kirim analisis naratif (chunked jika > 4000 karakter)."""
     full   = header + text
     chunks = [full[i:i+4000] for i in range(0, len(full), 4000)]
     async with aiohttp.ClientSession() as session:
@@ -625,8 +654,8 @@ async def send_to_telegram(text: str, header: str = ""):
 
 async def send_trade_cards(selected_data: list):
     """
-    Kirim kartu tap-to-copy per koin.
-    selected_data sudah diverifikasi dari respons AI yang sama → selalu konsisten.
+    Kirim kartu tap-to-copy per koin sebagai pesan terpisah.
+    selected_data sudah dari sumber yang sama dengan narasi AI → konsisten.
     """
     async with aiohttp.ClientSession() as session:
         for i, d in enumerate(selected_data, 1):
@@ -649,17 +678,16 @@ async def main():
 
     ts = datetime.now().strftime("%d %b %Y, %H:%M WIB")
     header = (
-        f"👑 *GOD MODE v5.2 — BULLETPROOF JSON*\n"
+        f"👑 *GOD MODE v5.3 — BULLETPROOF FINAL*\n"
         f"🕐 {ts} | 1H+15m+5m | Anti Stop-Hunt\n"
-        f"💰 Risk per trade: ${FIXED_RISK_USD} | R:R {RR_TP1}:{RR_TP2}\n"
+        f"💰 Risk/trade: ${FIXED_RISK_USD} | R:R {RR_TP1}:{RR_TP2} | SL max: {MAX_RISK_PCT}%\n"
         f"{'─' * 38}\n\n"
     )
 
-    logging.info("🚀 God Mode v5.2 dimulai...")
+    logging.info("🚀 God Mode v5.3 dimulai...")
 
     try:
         data = await get_high_precision_data()
-
         if not data:
             logging.error("Tidak ada data valid.")
             async with aiohttp.ClientSession() as s:
@@ -669,33 +697,31 @@ async def main():
                 )
             return
 
-        logging.info(f"✅ {len(data)} koin siap. Kirim ke Gemini (single call)...")
-
-        # ── Satu panggilan Gemini → narasi + simbol dari sumber yang sama ──
+        logging.info(f"✅ {len(data)} koin siap. Kirim ke Gemini...")
         analysis, selected_symbols = await ask_ai_agent(data)
 
-        # ── Map simbol ke data lengkap ──────────────────────────────────
-        symbol_lookup = {d['symbol']: d for d in data}
-        selected_data = [symbol_lookup[sym] for sym in selected_symbols if sym in symbol_lookup]
+        # Map simbol → data lengkap
+        sym_map       = {d['symbol']: d for d in data}
+        selected_data = [sym_map[s] for s in selected_symbols if s in sym_map]
 
         if not selected_data:
-            logging.warning("selected_data kosong — fallback ke data[:4]")
+            logging.warning("selected_data kosong — fallback data[:4]")
             selected_data = data[:4]
 
-        logging.info(
-            f"✅ AI memilih {len(selected_data)} koin: "
-            f"{[d['Symbol'] for d in selected_data]}"
-        )
+        logging.info(f"✅ AI memilih: {[d['Symbol'] for d in selected_data]}")
 
-        # ── Pesan 1: Header + analisis naratif ─────────────────────────
+        # Pesan 1: Header + narasi AI
         await send_to_telegram(analysis, header=header)
-        logging.info("✅ Analisis AI terkirim.")
+        logging.info("✅ Narasi AI terkirim.")
 
         await asyncio.sleep(1.5)
 
-        # ── Pesan 2+: Kartu tap-to-copy — 100% konsisten dengan narasi ─
+        # Pesan 2+: Kartu tap-to-copy per koin
         await send_trade_cards(selected_data)
         logging.info(f"✅ {len(selected_data)} kartu trade terkirim.")
+
+        # Catat ke CSV (untuk evaluasi mingguan/bulanan)
+        log_positions(selected_data)
 
     except Exception as e:
         logging.exception(f"❌ Fatal error: {e}")
