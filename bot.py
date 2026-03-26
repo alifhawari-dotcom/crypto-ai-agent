@@ -61,7 +61,7 @@ RETRY_DELAY  = 5
 LOG_FILE = "trade_history.csv"
 
 # ============================================================
-# INDIKATOR — SAMA PERSIS DENGAN v4.5
+# INDIKATOR
 # ============================================================
 
 def calc_atr(df: pd.DataFrame, period: int = ATR_PERIOD) -> pd.Series:
@@ -92,9 +92,10 @@ def calc_macd(close: pd.Series):
 
 def calc_squeeze(df: pd.DataFrame, atr: pd.Series) -> pd.Series:
     """BB masuk KC = volatilitas dimampatkan → breakout imminent."""
-    c, sd = df['close'], df['close'].rolling(20).std()
-    s     = df['close'].rolling(20).mean()
-    return (s + 2*sd < s + 1.5*atr) & (s - 2*sd > s - 1.5*atr)
+    # FIX: variable 'c' dihapus karena tidak dipakai — pakai df['close'] langsung
+    mean = df['close'].rolling(20).mean()
+    sd   = df['close'].rolling(20).std()
+    return (mean + 2*sd < mean + 1.5*atr) & (mean - 2*sd > mean - 1.5*atr)
 
 
 def _find_swings(highs, lows, lookback: int):
@@ -156,7 +157,8 @@ async def fetch_ohlcv_safe(exchange, symbol: str, tf: str, limit: int):
     except asyncio.TimeoutError:
         logging.debug(f"{symbol} {tf}: timeout")
     except Exception as e:
-        logging.debug(f"{symbol} {tf}: {e}")
+        # FIX: catch spesifik — debug info tidak hilang diam-diam
+        logging.debug(f"{symbol} {tf}: {type(e).__name__}: {e}")
     return None
 
 
@@ -218,9 +220,9 @@ async def phase2_enrich(exchange, c: dict) -> dict:
     )
     if df_1h is not None:
         i1    = build_indicators(df_1h)
-        v     = i1['close']
-        trend = ("UPTREND"   if v > i1['ema_f'] > i1['ema_s'] else
-                 "DOWNTREND" if v < i1['ema_f'] < i1['ema_s'] else
+        price = i1['close']
+        trend = ("UPTREND"   if price > i1['ema_f'] > i1['ema_s'] else
+                 "DOWNTREND" if price < i1['ema_f'] < i1['ema_s'] else
                  "RANGING")
         c.update({'Trend_1h': trend, 'power_1h': i1['power_score']})
     else:
@@ -247,9 +249,10 @@ def format_qty(qty: float) -> float:
 
 def finalize_candidate(c: dict) -> dict:
     """
-    Composite Score + Pine Script SL/TP + 2 guardrail:
-    1. Anti TP minus (TP short diklem minimal 1% dari entry)
-    2. Batalkan jika SL > MAX_RISK_PCT% dari entry
+    Composite Score + Pine Script SL/TP + guardrail:
+    1. Anti TP minus  — TP short diklem minimal 1% dari entry
+    2. Anti TP terbalik — TP1 selalu lebih kecil dari TP2
+    3. Batalkan setup  — SL > MAX_RISK_PCT% dari entry
     """
     p15 = c['power_15m']
     p1h = c.get('power_1h', p15)
@@ -283,10 +286,10 @@ def finalize_candidate(c: dict) -> dict:
     sl_val = c['Swing_Low_15m']
 
     # Entry: Buy/Sell Stop di Swing Level (breakout confirmation)
-    buy_stop  = round(sh    * 1.001, 6) if sh    > price else round(price + atr * 0.2, 6)
+    buy_stop  = round(sh     * 1.001, 6) if sh     > price else round(price + atr * 0.2, 6)
     sell_stop = round(sl_val * 0.999, 6) if sl_val < price else round(price - atr * 0.2, 6)
 
-    # SL: di balik swing + buffer 0.5×ATR (Pine Script anti stop-hunt)
+    # SL: di balik swing + buffer 0.5×ATR (anti stop-hunt)
     sl_long  = round(sl_val - atr * SL_ATR_BUFFER, 6)
     sl_short = round(sh     + atr * SL_ATR_BUFFER, 6)
 
@@ -294,14 +297,22 @@ def finalize_candidate(c: dict) -> dict:
     rs = max(sl_short  - sell_stop, 1e-9)
 
     # ── Guardrail 1: Anti TP Minus ────────────────────────────
+    # TP short diklem di minimal 1% dari entry agar tidak negatif/nol
     tp1_long  = round(buy_stop  + rl * RR_TP1, 6)
     tp2_long  = round(buy_stop  + rl * RR_TP2, 6)
     tp1_short = round(max(sell_stop - rs * RR_TP1, sell_stop * 0.01), 6)
     tp2_short = round(max(sell_stop - rs * RR_TP2, sell_stop * 0.01), 6)
 
-    # ── Guardrail 2: SL terlalu lebar = batalkan ──────────────
-    risk_pct_long  = round((rl / buy_stop)  * 100, 1)
-    risk_pct_short = round((rs / sell_stop) * 100, 1)
+    # ── Guardrail 2: Anti TP Terbalik ─────────────────────────
+    # Jika ATR ekstrem menyebabkan TP1 >= TP2, swap supaya urutan tetap benar
+    if tp1_long >= tp2_long:
+        tp1_long, tp2_long = tp2_long, tp1_long
+    if tp1_short <= tp2_short:
+        tp1_short, tp2_short = tp2_short, tp1_short
+
+    # ── Guardrail 3: SL terlalu lebar = batalkan ──────────────
+    risk_pct_long  = round((rl / buy_stop)   * 100, 1)
+    risk_pct_short = round((rs / sell_stop)  * 100, 1)
     wild_long  = risk_pct_long  > MAX_RISK_PCT
     wild_short = risk_pct_short > MAX_RISK_PCT
 
@@ -364,20 +375,20 @@ async def get_high_precision_data():
 
 # ============================================================
 # POSITION LOGGER — "Buku Harian Sniper"
-# Catat setiap sinyal ke trade_history.csv untuk evaluasi
-# mingguan/bulanan. File di-commit oleh GitHub Actions.
+# Catat setiap sinyal ke trade_history.csv untuk evaluasi mingguan/bulanan.
 # ============================================================
 
 def log_positions(selected_data: list):
     """
     Catat koin terpilih ke LOG_FILE (CSV).
-    Buat header jika file belum ada, append jika sudah ada.
+    Header 14 kolom — sinkron dengan data yang ditulis.
     """
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    ts      = datetime.now().strftime("%Y-%m-%d %H:%M")
+    headers = "Time,Symbol,Action,Entry,SL,TP1,TP2,Qty,Risk_Pct,Score,SM_Signal,Trend_1H,Aligned,Result\n"
 
     if not os.path.exists(LOG_FILE):
         with open(LOG_FILE, "w") as f:
-            f.write("Time,Symbol,Action,Entry,SL,TP1,TP2,Qty,Risk_Pct,Score,SM_Signal,Trend_1H,Aligned\n")
+            f.write(headers)
 
     with open(LOG_FILE, "a") as f:
         for d in selected_data:
@@ -387,15 +398,16 @@ def log_positions(selected_data: list):
             tp1   = d['TP1_Long']  if act == "LONG" else d['TP1_Short']
             tp2   = d['TP2_Long']  if act == "LONG" else d['TP2_Short']
             qty   = d['Qty_Long']  if act == "LONG" else d['Qty_Short']
-            rp    = d.get('Risk_Pct_Long') if act == "LONG" else d.get('Risk_Pct_Short')
+            rp    = d['Risk_Pct_Long'] if act == "LONG" else d['Risk_Pct_Short']
             aln   = "YES" if d.get('Aligned') else "NO"
             f.write(
                 f"{ts},{d['Symbol']},{act},{entry},{sl},{tp1},{tp2},"
                 f"{qty},{rp},{d['Composite']},{d['SM_Signal']},"
-                f"{d.get('Trend_1h','N/A')},{aln}\n"
+                f"{d.get('Trend_1h','N/A')},{aln},OPEN\n"
             )
 
-    logging.info(f"✅ {len(selected_data)} posisi dicatat di {LOG_FILE}")
+    # FIX: hapus baris logging duplikat yang ada di versi sebelumnya
+    logging.info(f"✅ {len(selected_data)} posisi dicatat di {LOG_FILE} (status: OPEN)")
 
 
 # ============================================================
@@ -404,7 +416,6 @@ def log_positions(selected_data: list):
 # Root cause bug produksi (v5.1):
 #   AI mengembalikan "picks": "A","B","C" (tanpa kurung siku [ ])
 #   → JSONDecodeError → fallback total → teks mentah ke Telegram
-#   → kartu trade tidak konsisten dengan narasi AI
 #
 # Fix v5.3:
 #   Parser 5 level — tahan semua variasi format rusak dari AI
@@ -426,8 +437,9 @@ FORMAT BALASAN: HANYA JSON VALID, TANPA TEKS LAIN, TANPA MARKDOWN FENCE.
 }}
 
 ATURAN WAJIB:
-- picks HARUS array kurung siku [ ] contoh: ["BTC/USDT:USDT","ETH/USDT:USDT"]
-- picks HARUS simbol persis dari kolom symbol: di data
+- picks HARUS array dengan KURUNG SIKU [ ] — contoh: ["BTC/USDT:USDT","ETH/USDT:USDT"]
+- Isi picks HARUS simbol persis dari kolom symbol: di data
+- Koin di analysis dan picks HARUS IDENTIK
 - TP tidak boleh negatif atau nol
 """
 
@@ -450,12 +462,12 @@ def _parse_ai_response(raw: str, data_list: list) -> tuple[str, list[str]]:
     L1: json.loads normal
     L2: regex cari blok {...} pertama
     L3: regex ekstrak "picks": [...]
-    L4: regex ekstrak "picks": "a","b" (tanpa kurung siku ← root cause bug)
+    L4: regex ekstrak "picks": "a","b" (tanpa kurung siku ← root cause bug produksi)
     L5: scan seluruh teks untuk simbol valid
     Fallback total → pesan bersih + data[:4]
     """
-    valid  = {d['symbol'] for d in data_list}
-    clean  = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw.strip(), flags=re.MULTILINE).strip()
+    valid = {d['symbol'] for d in data_list}
+    clean = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw.strip(), flags=re.MULTILINE).strip()
 
     def validate(candidates: list) -> list:
         return [s.strip() for s in candidates if s.strip() in valid][:4]
@@ -563,7 +575,7 @@ async def ask_ai_agent(data_list: list) -> tuple[str, list[str]]:
                             break
                         logging.warning(f"{model} attempt {attempt}: HTTP {resp.status}")
                 except Exception as e:
-                    logging.warning(f"{model} attempt {attempt}: {e}")
+                    logging.warning(f"{model} attempt {attempt}: {type(e).__name__}: {e}")
                 if attempt < MAX_RETRIES:
                     await asyncio.sleep(RETRY_DELAY)
 
@@ -633,7 +645,7 @@ async def _tg_post(session: aiohttp.ClientSession, payload: dict) -> bool:
                         return r2.status == 200
                 logging.warning(f"Telegram attempt {attempt}: HTTP {resp.status}")
         except Exception as e:
-            logging.warning(f"Telegram attempt {attempt}: {e}")
+            logging.warning(f"Telegram attempt {attempt}: {type(e).__name__}: {e}")
         if attempt < MAX_RETRIES:
             await asyncio.sleep(RETRY_DELAY)
     return False
@@ -677,12 +689,6 @@ async def main():
         return
 
     ts = datetime.now().strftime("%d %b %Y, %H:%M WIB")
-    header = (
-        f"👑 *GOD MODE v5.3 — BULLETPROOF FINAL*\n"
-        f"🕐 {ts} | 1H+15m+5m | Anti Stop-Hunt\n"
-        f"💰 Risk/trade: ${FIXED_RISK_USD} | R:R {RR_TP1}:{RR_TP2} | SL max: {MAX_RISK_PCT}%\n"
-        f"{'─' * 38}\n\n"
-    )
 
     logging.info("🚀 God Mode v5.3 dimulai...")
 
@@ -697,7 +703,22 @@ async def main():
                 )
             return
 
-        logging.info(f"✅ {len(data)} koin siap. Kirim ke Gemini...")
+        # Hitung ringkasan cancel untuk header
+        n_cancel = sum(
+            1 for d in data
+            if (d['Composite'] > 0 and d['Cancel_Long']) or
+               (d['Composite'] <= 0 and d['Cancel_Short'])
+        )
+
+        header = (
+            f"👑 *GOD MODE v5.3 — BULLETPROOF FINAL*\n"
+            f"🕐 {ts} | 1H+15m+5m | Anti Stop-Hunt\n"
+            f"💰 Risk/trade: ${FIXED_RISK_USD} | R:R {RR_TP1}:{RR_TP2} | SL max: {MAX_RISK_PCT}%\n"
+            f"📊 Scan: {len(data)} koin | ⚠️ Cancel: {n_cancel}\n"
+            f"{'─' * 38}\n\n"
+        )
+
+        logging.info(f"✅ {len(data)} koin siap ({n_cancel} cancel). Kirim ke Gemini...")
         analysis, selected_symbols = await ask_ai_agent(data)
 
         # Map simbol → data lengkap
@@ -720,7 +741,7 @@ async def main():
         await send_trade_cards(selected_data)
         logging.info(f"✅ {len(selected_data)} kartu trade terkirim.")
 
-        # Catat ke CSV (untuk evaluasi mingguan/bulanan)
+        # Catat ke CSV untuk evaluasi mingguan/bulanan
         log_positions(selected_data)
 
     except Exception as e:
