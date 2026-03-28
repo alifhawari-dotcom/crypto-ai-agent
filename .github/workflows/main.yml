@@ -1,17 +1,23 @@
-name: Crypto AI Agent 2026
+name: Apex Quant v6.0 Executor
 
 on:
-  # Berjalan otomatis setiap jam (agar irit kuota Gemini)
+  # [Sangat Penting] Bagian 'on: push' sengaja dihapus agar bot tidak looping
   schedule:
-    - cron: '0 * * * *'
-  # Memungkinkan pemicu manual dari tab Actions
+    # 1. Menjalankan Bot setiap 2 jam sekali (Sesuai permintaanmu)
+    - cron: "0 */2 * * *"
+    
+    # 2. Upgrade High Impact: Time-based Exit Alert (22:30 WIB / 15:30 UTC)
+    # Untuk memitigasi risiko volatilitas saat tidur (Overnight Gap Risk)
+    - cron: "30 15 * * *"
+
+  # Memungkinkan pemicu manual dari tab Actions jika kamu ingin tes kapan saja
   workflow_dispatch:
 
 jobs:
-  build:
+  trade_job:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
+      - name: Checkout Code
         uses: actions/checkout@v4
         
       - name: Set up Python
@@ -19,22 +25,21 @@ jobs:
         with:
           python-version: '3.11'
           
-      - name: Install dependencies
+      - name: Install Dependencies
         run: pip install ccxt aiohttp pandas numpy
         
-      - name: Run Bot
+      - name: Run Apex Quant v6.0
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python bot.py
 
-      # 🚀 BAGIAN KRUSIAL UNTUK MENYIMPAN JURNAL:
-      - name: Auto-Save Logs
+      - name: Auto-Save Logs to History
         run: |
-          git config --global user.name "Bot-Logger"
-          git config --global user.email "[email protected]"
-          # Cek jika ada perubahan pada file csv, jika ada maka commit dan push
-          git add trade_history.csv || echo "Belum ada file log."
-          git commit -m "Update trade history [skip ci]" || echo "Tidak ada perubahan data."
+          git config --global user.name "Apex-Quant-Logger"
+          git config --global user.email "bot@apexquant.ai"
+          # Menambahkan [skip ci] di commit agar GitHub tidak menjalankan workflow lagi
+          git add trade_history.csv || echo "File log belum ada."
+          git commit -m "Update trade history [skip ci]" || echo "Tidak ada perubahan data untuk disimpan."
           git push
