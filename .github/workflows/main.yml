@@ -2,16 +2,19 @@ name: Apex Quant v6.2 Sniper & Auditor
 
 on:
   schedule:
-    - cron: "0 */2 * * *"  # Bot jalan otomatis setiap 3 jam
-    - cron: "30 15 * * *"  # Alert jam tidur (22:30 WIB)
-  workflow_dispatch:       # Memungkinkan kamu menjalankan Bot atau Auditor secara manual
+    # Menjalankan Bot otomatis setiap 3 jam (00:00, 03:00, 06:00, dst dalam UTC)
+    - cron: "0 */3 * * *"  
+    # Alert penutupan posisi sebelum tidur (15:30 UTC / 22:30 WIB)
+    - cron: "30 15 * * *"  
+  workflow_dispatch:       # Tombol manual di tab Actions (Bisa pilih jalankan Bot atau Audit)
 
+# Mencegah bot berjalan double jika jadwal berhimpitan
 concurrency:
   group: apex-quant-flow
   cancel-in-progress: true
 
 jobs:
-  # JOB 1: Eksekusi Bot Trading (Otomatis)
+  # JOB 1: Eksekusi Bot Trading (Berjalan Otomatis & Manual)
   trading_job:
     runs-on: ubuntu-latest
     steps:
@@ -29,15 +32,15 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python bot.py
-      - name: Save Logs
+      - name: Save Trading Logs
         run: |
           git config --global user.name "Apex-Logger"
           git config --global user.email "bot@apexquant.ai"
-          git add trade_history.csv || echo "No logs"
-          git commit -m "Update history [skip ci]" || echo "No changes"
+          git add trade_history.csv || echo "No changes"
+          git commit -m "Update trade history [skip ci]" || echo "No changes"
           git push
 
-  # JOB 2: Auditor Jurnal (Hanya jalan jika dipicu manual)
+  # JOB 2: Auditor Jurnal (HANYA berjalan jika diklik MANUAL)
   audit_job:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
@@ -56,15 +59,7 @@ jobs:
         run: |
           git config --global user.name "Bot-Auditor"
           git config --global user.email "auditor@apexquant.ai"
-          git add trade_history.csv || echo "No file"
-          git commit -m "Audit results [skip ci]" || echo "No changes"
+          git add trade_history.csv || echo "No changes"
+          git commit -m "Audit results (Win/Loss) [skip ci]" || echo "No changes"
           git push
-
-      - name: Auto-Save Logs to History
-        run: |
-          git config --global user.name "Apex-Quant-Logger"
-          git config --global user.email "bot@apexquant.ai"
-          # Menambahkan [skip ci] di commit agar GitHub tidak menjalankan workflow lagi
-          git add trade_history.csv || echo "File log belum ada."
-          git commit -m "Update trade history [skip ci]" || echo "Tidak ada perubahan data untuk disimpan."
-          git push
+          
