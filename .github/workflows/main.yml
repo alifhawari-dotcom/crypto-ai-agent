@@ -1,39 +1,64 @@
-name: Apex Quant v6.0 Executor
+name: Apex Quant v6.2 Sniper & Auditor
 
 on:
-  # [Sangat Penting] Bagian 'on: push' sengaja dihapus agar bot tidak looping
   schedule:
-    # 1. Menjalankan Bot setiap 2 jam sekali (Sesuai permintaanmu)
-    - cron: "0 */2 * * *"
-    
-    # 2. Upgrade High Impact: Time-based Exit Alert (22:30 WIB / 15:30 UTC)
-    # Untuk memitigasi risiko volatilitas saat tidur (Overnight Gap Risk)
-    - cron: "30 15 * * *"
+    - cron: "0 */2 * * *"  # Bot jalan otomatis setiap 3 jam
+    - cron: "30 15 * * *"  # Alert jam tidur (22:30 WIB)
+  workflow_dispatch:       # Memungkinkan kamu menjalankan Bot atau Auditor secara manual
 
-  # Memungkinkan pemicu manual dari tab Actions jika kamu ingin tes kapan saja
-  workflow_dispatch:
+concurrency:
+  group: apex-quant-flow
+  cancel-in-progress: true
 
 jobs:
-  trade_job:
+  # JOB 1: Eksekusi Bot Trading (Otomatis)
+  trading_job:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
-        
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          
       - name: Install Dependencies
         run: pip install ccxt aiohttp pandas numpy
-        
-      - name: Run Apex Quant v6.0
+      - name: Run Apex Quant v6.2
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python bot.py
+      - name: Save Logs
+        run: |
+          git config --global user.name "Apex-Logger"
+          git config --global user.email "bot@apexquant.ai"
+          git add trade_history.csv || echo "No logs"
+          git commit -m "Update history [skip ci]" || echo "No changes"
+          git push
+
+  # JOB 2: Auditor Jurnal (Hanya jalan jika dipicu manual)
+  audit_job:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install Dependencies
+        run: pip install ccxt pandas numpy aiohttp
+      - name: Run Evaluator
+        run: python evaluator.py
+      - name: Save Audit Results
+        run: |
+          git config --global user.name "Bot-Auditor"
+          git config --global user.email "auditor@apexquant.ai"
+          git add trade_history.csv || echo "No file"
+          git commit -m "Audit results [skip ci]" || echo "No changes"
+          git push
 
       - name: Auto-Save Logs to History
         run: |
