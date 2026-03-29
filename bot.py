@@ -19,7 +19,7 @@ TG_TOKEN   = os.getenv('TELEGRAM_TOKEN')
 TG_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
 # ============================================================
-# CONSTANTS (V6.1 — APEX QUANT + BACKTEST UPGRADES)
+# CONSTANTS (V6.2 — THE ADAPTIVE SNIPER)
 #
 # Perubahan dari v6.0:
 #   [U1] Weekend Blackout Filter: skip scan Jumat 20:00 – Senin 09:00 WIB.
@@ -40,15 +40,12 @@ GEMINI_MODELS = [
 ]
 
 # ── Universe Screening ────────────────────────────────────────
-TOP_COINS_BY_RVOL   = 40      # Ambil top-40 setelah ranking RVOL
-RANKED_CANDIDATES   = 10      # Kandidat yang masuk Fase 2 enrichment
+TOP_COINS_BY_RVOL   = 50      # Ambil top-50 setelah ranking RVOL (V6.2: naik dari 40)
+RANKED_CANDIDATES   = 12      # Kandidat yang masuk Fase 2 enrichment (V6.2: naik dari 10)
 CANDLES_REQUIRED    = 100
 
-MIN_VOLUME_USD      = 10_000_000   # $10 juta quoteVolume 24h — gatekeeper anti micro-cap
-                                   # Lebih rendah dari v5.4 ($50M) karena RVOL sudah menyaring
-                                   # koin "tidur" bervolume besar tapi tidak bergerak.
-                                   # JST ($3.6M) tetap tidak lolos. BTC tetap lolos tapi akan
-                                   # kalah ranking RVOL dari altcoin yang sedang pump.
+# MIN_VOLUME_USD dihapus di V6.2 — digantikan oleh Dynamic Volume Threshold
+# (persentil 70 dari quoteVolume seluruh market, batas bawah $5M)
 
 # ── ADX Market Regime Filter ─────────────────────────────────
 ADX_PERIOD          = 14           # Periode ADX
@@ -59,7 +56,7 @@ ADX_MIN_NORMAL      = 22.0         # Threshold minimal untuk sinyal non-NUCLEAR
 
 # ── Correlation Filter ────────────────────────────────────────
 CORR_WINDOW         = 30           # Candle 1H untuk hitung korelasi (~30 jam)
-CORR_THRESHOLD      = 0.82         # Korelasi di atas ini → buang yang skornya lebih rendah
+CORR_THRESHOLD      = 0.78         # Korelasi di atas ini → buang yang skornya lebih rendah (V6.2: turun dari 0.82)
 # Logika: cegah 4 posisi yang sebenarnya cuma 1 posisi (semua naik/turun bareng BTC)
 
 # ── Risk Management ──────────────────────────────────────────
@@ -243,6 +240,176 @@ def is_weekend_blackout() -> tuple[bool, str]:
 
 
 # ============================================================
+# SMC / WYCKOFF DETECTION (V6.2 — COSMETIC LABELS ONLY)
+# Fungsi-fungsi ini HANYA menghasilkan label/tag untuk display.
+# DILARANG KERAS menambahkan smc_bonus ke Composite Score.
+# ============================================================
+
+def detect_liquidity_sweep(df: pd.DataFrame, lookback: int = 20) -> str:
+    """
+    Deteksi liquidity sweep: harga menembus swing high/low lalu
+    close kembali di dalam range = stop hunt oleh smart money.
+    """
+    if len(df) < lookback + 2:
+        return ""
+    recent = df.iloc[-lookback:]
+    last = df.iloc[-1]
+    prev_high = recent['high'].iloc[:-1].max()
+    prev_low = recent['low'].iloc[:-1].min()
+
+    # Bullish sweep: wick menembus prev low tapi close di atas
+    if last['low'] < prev_low and last['close'] > prev_low:
+        return "🧹SweepLow"
+    # Bearish sweep: wick menembus prev high tapi close di bawah
+    if last['high'] > prev_high and last['close'] < prev_high:
+        return "🧹SweepHigh"
+    return ""
+
+
+def detect_order_block(df: pd.DataFrame, lookback: int = 10) -> str:
+    """
+    Deteksi Order Block: candle terakhir sebelum move impulsif.
+    Bullish OB: candle bearish terakhir sebelum rally kuat.
+    Bearish OB: candle bullish terakhir sebelum drop kuat.
+    """
+    if len(df) < lookback + 2:
+        return ""
+    last = df.iloc[-1]
+    atr = calc_atr(df).iloc[-1]
+    if atr == 0:
+        return ""
+
+    for i in range(-lookback, -1):
+        candle = df.iloc[i]
+        next_candle = df.iloc[i + 1]
+        move = abs(next_candle['close'] - candle['close'])
+        if move > atr * 2.0:
+            # Impulsive move detected
+            if candle['close'] < candle['open'] and next_candle['close'] > next_candle['open']:
+                # Bullish OB: bearish candle sebelum bullish impulse
+                if last['low'] <= candle['high'] and last['close'] > candle['low']:
+                    return "🟩BullOB"
+            elif candle['close'] > candle['open'] and next_candle['close'] < next_candle['open']:
+                # Bearish OB: bullish candle sebelum bearish impulse
+                if last['high'] >= candle['low'] and last['close'] < candle['high']:
+                    return "🟥BearOB"
+    return ""
+
+
+def detect_fair_value_gap(df: pd.DataFrame) -> str:
+    """
+    Fair Value Gap (FVG/Imbalance): gap antara candle 1 dan candle 3
+    yang tidak di-fill oleh candle 2. Menunjukkan area demand/supply.
+    """
+    if len(df) < 4:
+        return ""
+    c1, c2, c3 = df.iloc[-3], df.iloc[-2], df.iloc[-1]
+
+    # Bullish FVG: low candle 3 > high candle 1 (gap naik)
+    if c3['low'] > c1['high']:
+        return "📊BullFVG"
+    # Bearish FVG: high candle 3 < low candle 1 (gap turun)
+    if c3['high'] < c1['low']:
+        return "📊BearFVG"
+    return ""
+
+
+def detect_wyckoff_spring_upthrust(df: pd.DataFrame, lookback: int = 30) -> str:
+    """
+    Wyckoff Spring: harga break di bawah support lalu langsung recover
+    (false breakdown = akumulasi oleh composite man).
+    Upthrust: harga break di atas resistance lalu langsung reject
+    (false breakout = distribusi).
+    """
+    if len(df) < lookback + 2:
+        return ""
+    recent = df.iloc[-lookback:]
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+    support = recent['low'].iloc[:-2].min()
+    resistance = recent['high'].iloc[:-2].max()
+    atr = calc_atr(df).iloc[-1]
+    if atr == 0:
+        return ""
+
+    # Spring: tembus support lalu close di atas, dengan body recovery
+    if (prev['low'] < support and
+        last['close'] > support and
+        (last['close'] - last['open']) > atr * 0.3):
+        return "🌀Spring"
+
+    # Upthrust: tembus resistance lalu close di bawah, dengan body rejection
+    if (prev['high'] > resistance and
+        last['close'] < resistance and
+        (last['open'] - last['close']) > atr * 0.3):
+        return "🌀Upthrust"
+    return ""
+
+
+def detect_break_of_structure(df: pd.DataFrame, lookback: int = 20) -> str:
+    """
+    Break of Structure (BOS): harga membuat higher high (bullish BOS)
+    atau lower low (bearish BOS) relatif terhadap swing sebelumnya.
+    Konfirmasi perubahan karakter pasar.
+    """
+    if len(df) < lookback + 2:
+        return ""
+    recent_h = df['high'].iloc[-lookback:-1]
+    recent_l = df['low'].iloc[-lookback:-1]
+    last = df.iloc[-1]
+
+    prev_hh = recent_h.max()
+    prev_ll = recent_l.min()
+
+    # Bullish BOS: close di atas previous high
+    if last['close'] > prev_hh:
+        return "⚡BullBOS"
+    # Bearish BOS: close di bawah previous low
+    if last['close'] < prev_ll:
+        return "⚡BearBOS"
+    return ""
+
+
+def compute_smc_score(df: pd.DataFrame) -> tuple[list[str], int]:
+    """
+    Jalankan semua detektor SMC/Wyckoff, kumpulkan label.
+    Return: (list_of_labels, smc_bonus)
+
+    CATATAN V6.2: smc_bonus dihitung tapi TIDAK dipakai di Composite Score.
+    Hanya labels yang ditampilkan di kartu Telegram.
+    """
+    labels = []
+    bonus = 0
+
+    sweep = detect_liquidity_sweep(df)
+    if sweep:
+        labels.append(sweep)
+        bonus += 3
+
+    ob = detect_order_block(df)
+    if ob:
+        labels.append(ob)
+        bonus += 4
+
+    fvg = detect_fair_value_gap(df)
+    if fvg:
+        labels.append(fvg)
+        bonus += 2
+
+    wyckoff = detect_wyckoff_spring_upthrust(df)
+    if wyckoff:
+        labels.append(wyckoff)
+        bonus += 5
+
+    bos = detect_break_of_structure(df)
+    if bos:
+        labels.append(bos)
+        bonus += 3
+
+    return labels, bonus
+
+
+# ============================================================
 # RVOL SCREENING
 # ============================================================
 
@@ -403,6 +570,18 @@ async def phase2_enrich(exchange, c: dict) -> dict:
     else:
         c.update({'z_score_5m': 0.0, 'SM_Signal': '😴QUIET',
                   'SM_Bonus': 0, 'power_5m': c['power_15m']})
+
+    # ── V6.2: SMC/Wyckoff Label Detection (COSMETIC ONLY) ─────────
+    # Jalankan pada TF 1H (pola SMC lebih reliable di higher TF).
+    # Fallback ke 5m jika 1H tidak tersedia.
+    # Label HANYA untuk display — TIDAK mempengaruhi Composite Score.
+    smc_df = df_1h if df_1h is not None else df_5m
+    if smc_df is not None:
+        smc_labels, _smc_bonus = compute_smc_score(smc_df)
+        c['smc_labels'] = " ".join(smc_labels) if smc_labels else ""
+    else:
+        c['smc_labels'] = ""
+
     return c
 
 
@@ -500,7 +679,7 @@ def finalize_candidate(c: dict) -> dict:
     if wild_short:
         logging.debug(f"{c['Symbol']} SHORT wild: risk {risk_pct_short}% > {MAX_RISK_PCT}%")
     if sideways:
-        logging.debug(f"{c['Symbol']} sideways: ADX {adx_val} < {adx_thresh}")
+        logging.debug(f"{c['Symbol']} sideways: ADX {adx_val} < {ADX_MIN_NORMAL}")
 
     c.update({
         'Buy_Stop':       buy_stop,
@@ -598,10 +777,20 @@ async def get_high_precision_data():
     try:
         tickers = await exchange.fetch_tickers()
 
-        # ── Step 1: Gatekeeper volume minimum (anti micro-cap pump) ──
+        # ── Step 1: Dynamic Volume Threshold (V6.2) ─────────────────
+        # Menggantikan MIN_VOLUME_USD statis ($10M).
+        # Persentil 70 dari quoteVolume seluruh market × 0.5, batas bawah $5M.
+        # HANYA quoteVolume murni — DILARANG membagi dengan last (bukan Market Cap Proxy).
+        all_vols = [float(v.get('quoteVolume', 0)) for v in tickers.values() if float(v.get('quoteVolume', 0)) > 0]
+        if all_vols:
+            p70_vol = np.percentile(all_vols, 70)
+            dynamic_min_vol = max(5_000_000, p70_vol * 0.5)  # Batas bawah absolut $5 Juta
+        else:
+            dynamic_min_vol = 7_000_000
+
         liquid = [
             v for v in tickers.values()
-            if v.get('quoteVolume', 0) >= MIN_VOLUME_USD and v.get('last')
+            if float(v.get('quoteVolume', 0)) >= dynamic_min_vol and v.get('last')
         ]
 
         # ── Step 2: RVOL Ranking ──────────────────────────────────────
@@ -615,7 +804,8 @@ async def get_high_precision_data():
         top = sorted(liquid, key=lambda x: x['_rvol'], reverse=True)[:TOP_COINS_BY_RVOL]
 
         logging.info(
-            f"Universe: {len(tickers)} koin → {len(liquid)} liquid (>=${MIN_VOLUME_USD/1e6:.0f}M) "
+            f"Universe: {len(tickers)} koin → {len(liquid)} liquid "
+            f"(dynamic_min=${dynamic_min_vol/1e6:.1f}M, p70=${p70_vol/1e6:.1f}M) "
             f"→ top-{len(top)} by RVOL"
         )
         if top:
@@ -897,10 +1087,17 @@ def build_trade_message(d: dict, rank: int) -> str:
             reason = "1H UPTREND"
         cancel_warn = f"\n⚠️ *CANCEL* — {reason}"
 
+    # V6.2: SMC label line — hanya muncul jika ada label SMC
+    smc_line = ""
+    smc_labels = d.get('smc_labels', '')
+    if smc_labels:
+        smc_line = f"🔬 SMC: {smc_labels}\n"
+
     return (
         f"{act_emoji} *{rank}. {d['Symbol']} — {act_label}*  "
         f"`{d['Matrix_Sync']}`  {align_badge}{sqz_badge}{adx_badge}{rvol_badge}\n"
         f"📊 SM: {d['SM_Signal']}  Score: `{d['Composite']}`  1H: {d['Trend_1h']}\n"
+        f"{smc_line}"
         f"{'─' * 28}\n"
         f"📌 *{entry_type}*\n"
         f"  Entry : `{entry}`\n"
@@ -908,7 +1105,8 @@ def build_trade_message(d: dict, rank: int) -> str:
         f"  TP1   : `{tp1}`  _(R:R 1:{RR_TP1})_\n"
         f"  TP2   : `{tp2}`  _(R:R 1:{RR_TP2})_\n"
         f"  Qty   : `{qty}` koin  _(Risk ~${FIXED_RISK_USD})_"
-        f"{cancel_warn}"
+        f"{cancel_warn}\n"
+        f"🛡️ STRATEGY ALERT: Segera geser SL ke Entry (BEP) saat harga menyentuh TP1!"
     )
 
 
@@ -968,14 +1166,14 @@ async def main():
         return
 
     ts = datetime.now().strftime("%d %b %Y, %H:%M WIB")
-    logging.info("🚀 God Mode v6.1 dimulai...")
+    logging.info("🚀 God Mode v6.2 — The Adaptive Sniper dimulai...")
 
     # ── Upgrade 1: Weekend Blackout Filter ───────────────────────────────────
     # Backtest 2 tahun: 6 dari 7 consecutive-loss streak terjadi periode ini.
     blackout, blackout_reason = is_weekend_blackout()
     if blackout:
         msg = (
-            f"😴 *GOD MODE v6.1 — WEEKEND BLACKOUT*\n"
+            f"😴 *GOD MODE v6.2 — WEEKEND BLACKOUT*\n"
             f"🕐 {ts}\n"
             f"⛔ Scan ditunda: {blackout_reason}\n"
             f"_Bot akan aktif kembali Senin pukul 09:00 WIB._"
@@ -1007,8 +1205,8 @@ async def main():
         n_sideways = sum(1 for d in data if d.get('Sideways'))
 
         header = (
-            f"👑 *GOD MODE v6.1 — APEX QUANT*\n"
-            f"🕐 {ts} | 1H+15m+5m | RVOL + ADX + CorrFilter + Weekend Guard\n"
+            f"👑 *GOD MODE v6.2 — THE ADAPTIVE SNIPER*\n"
+            f"🕐 {ts} | 1H+15m+5m | RVOL + ADX + CorrFilter + SMC Labels + Weekend Guard\n"
             f"💰 Risk/trade: ${FIXED_RISK_USD} | R:R {RR_TP1}:{RR_TP2} | SL max: {MAX_RISK_PCT}%\n"
             f"📊 Scan: {len(data)} koin | ⚠️ Cancel: {n_cancel} | 😴 Sideways: {n_sideways}\n"
             f"{'─' * 38}\n\n"
