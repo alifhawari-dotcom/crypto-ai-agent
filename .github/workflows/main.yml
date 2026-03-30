@@ -3,7 +3,7 @@ name: Apex Quant v6.2 Sniper & Auditor
 on:
   schedule:
     # Menjalankan Bot otomatis setiap 3 jam (00:00, 03:00, 06:00, dst dalam UTC)
-    - cron: "0 */3 * * *"  
+    - cron: "0 */2 * * *"  
     # Alert penutupan posisi sebelum tidur (15:30 UTC / 22:30 WIB)
     - cron: "30 15 * * *"  
   workflow_dispatch:       # Tombol manual di tab Actions (Bisa pilih jalankan Bot atau Audit)
