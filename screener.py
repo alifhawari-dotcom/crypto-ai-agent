@@ -6,7 +6,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 TG_TOKEN   = (os.getenv('TELEGRAM_TOKEN')   or '').strip()
 TG_CHAT_ID = (os.getenv('TELEGRAM_CHAT_ID') or '').strip()
@@ -250,9 +250,7 @@ def build_indicators(df):
 async def phase1_scan(session, coin):
     df = await fetch_ohlcv_safe(session, coin['symbol'], '15m', CANDLES_REQUIRED)
     if df is None:
-        logging.debug(f"  SKIP {coin['symbol']} — candle fetch gagal")
         return None
-    logging.debug(f"  OK   {coin['symbol']} — {len(df)} candles")
     i = build_indicators(df)
     return {
         'symbol':         coin['symbol'],
@@ -347,10 +345,11 @@ def finalize_screener(c):
     c['Conviction'] = conv
     c['Checklist']  = (int(has_fvg) + int(aligned) + int(not is_side) +
                        int(conv >= CONV_VALID) + int(has_ob))
-    if is_cancel or conv < CONV_VALID:             c['Tier'] = "REJECT"
-    elif conv >= CONV_INST and c['Checklist'] >= 5: c['Tier'] = "INSTITUTIONAL"
-    elif conv >= CONV_VALID and c['Checklist'] >= 4: c['Tier'] = "VALID"
-    else:                                            c['Tier'] = "WEAK"
+    if is_cancel or conv < 40:                      c['Tier'] = "REJECT"
+    elif conv >= CONV_INST and c['Checklist'] >= 4:  c['Tier'] = "INSTITUTIONAL"
+    elif conv >= CONV_VALID and c['Checklist'] >= 3: c['Tier'] = "VALID"
+    elif conv >= 40:                                 c['Tier'] = "WEAK"
+    else:                                            c['Tier'] = "REJECT"
     return c
 
 def filter_by_correlation(candidates):
@@ -415,9 +414,23 @@ async def get_screener_data():
         all_vols        = [t['quoteVolume'] for t in all_tickers if t['quoteVolume'] > 0]
         dynamic_min_vol = (max(5_000_000, np.percentile(all_vols, 70) * 0.5)
                            if all_vols else 7_000_000)
+        # Major coins whitelist — selalu masuk universe terlepas dari rvol
+        MAJOR = {"BTC","ETH","SOL","BNB","XRP","ADA","AVAX","DOGE","LINK","DOT",
+                 "UNI","LTC","BCH","ATOM","XLM","ETC","NEAR","APT","ARB","OP",
+                 "INJ","SUI","TIA","HYPE","AAVE","TAO","ENA","LDO","ORDI","WIF"}
+
         liquid = [t for t in all_tickers
                   if t['quoteVolume'] >= dynamic_min_vol and t['last'] > 0]
-        top    = sorted(liquid, key=lambda x: x['_rvol'], reverse=True)[:TOP_COINS_BY_RVOL]
+
+        # Pisah: major coins vs others
+        majors = [t for t in liquid if t['symbol'].split('/')[0] in MAJOR]
+        others = [t for t in liquid if t['symbol'].split('/')[0] not in MAJOR]
+
+        # Major coins masuk semua, others diranking by rvol untuk sisa slot
+        others_sorted = sorted(others, key=lambda x: x['_rvol'], reverse=True)
+        combined = majors + others_sorted
+        top = combined[:TOP_COINS_BY_RVOL]
+        logging.info(f"Universe: {len(majors)} major + {len(others_sorted)} others → Top {len(top)}")
 
         logging.info(f"Gate.io: {len(all_tickers)} contracts → Top {len(top)} liquid. Fetch OHLCV...")
 
@@ -442,6 +455,11 @@ async def get_screener_data():
 
         finalized = sorted([finalize_screener(c) for c in enriched],
                            key=lambda x: x['Conviction'], reverse=True)
+        # Log conviction stats untuk monitoring
+        convs = [c['Conviction'] for c in finalized]
+        tiers = [c['Tier'] for c in finalized]
+        logging.info(f"Conviction scores: {convs}")
+        logging.info(f"Tiers: {tiers}")
         return filter_by_correlation(finalized)
 
     except Exception as e:
