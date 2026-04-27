@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import requests as req_lib
 import aiohttp
 import ccxt.async_support as ccxt
 import pandas as pd
@@ -9,8 +10,10 @@ from datetime import datetime
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-TG_TOKEN   = os.getenv('TELEGRAM_TOKEN')
-TG_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+TG_TOKEN       = os.getenv('TELEGRAM_TOKEN')
+TG_CHAT_ID     = os.getenv('TELEGRAM_CHAT_ID')
+BYBIT_API_KEY  = os.getenv('BYBIT_API_KEY')
+BYBIT_SECRET   = os.getenv('BYBIT_API_SECRET')
 
 # ── CONSTANTS ────────────────────────────────────────────────
 TOP_COINS_BY_RVOL   = 50
@@ -30,7 +33,7 @@ MAX_RETRIES         = 3
 RETRY_DELAY         = 5
 WEEKEND_BLACKOUT    = True
 
-# ── V7.1 TIER THRESHOLDS (Sama persis dengan Pine Script) ───
+# ── V7.1 TIER THRESHOLDS ────────────────────────────────────
 CONV_VALID = 55
 CONV_HIGH  = 60
 CONV_INST  = 75
@@ -110,48 +113,41 @@ def compute_rvol(ticker):
     last = float(ticker.get('last') or 1e-9)
     return (vol * max(chg, 0.1)) / last
 
-# ── SMC DETECTORS (Lightweight, mendukung Pine Script v7.1) ─
+# ── SMC DETECTORS ───────────────────────────────────────────
 def detect_fvg_simple(df, lookback=20):
-    """Scan 1 FVG terdekat (bullish/bearish) tanpa nested loop."""
     if len(df) < 5: return False, False
     atr = calc_atr(df).iloc[-1]
     if atr == 0: return False, False
     min_size = atr * 0.3
-    
     for i in range(2, min(lookback+1, len(df))):
-        # Bullish FVG
         if df['low'].iloc[i-2] < df['low'].iloc[i] and (df['low'].iloc[i] - df['low'].iloc[i-2]) >= min_size:
             if not (df['close'].iloc[i-1] <= df['low'].iloc[i] and df['close'].iloc[i-1] >= df['low'].iloc[i-2]):
                 return True, False
-        # Bearish FVG
         if df['high'].iloc[i] < df['high'].iloc[i-2] and (df['high'].iloc[i-2] - df['high'].iloc[i]) >= min_size:
             if not (df['close'].iloc[i-1] >= df['high'].iloc[i] and df['close'].iloc[i-1] <= df['high'].iloc[i-2]):
                 return False, True
     return False, False
 
 def detect_ob_simple(df, lookback=10):
-    """Scan 1 Order Block terdekat dengan syarat impulse + volume."""
     if len(df) < 5: return False, False
     atr = calc_atr(df).iloc[-1]
     if atr == 0: return False, False
     vol_avg = df['volume'].rolling(20).mean().iloc[-1]
     if vol_avg == 0: return False, False
-
     for i in range(1, min(lookback+1, len(df)-1)):
         imp = abs(df['close'].iloc[i-1] - df['close'].iloc[i])
         vol_ok = df['volume'].iloc[i-1] > vol_avg * 1.5
-        
         if imp > atr * 2.0 and vol_ok:
-            if df['open'].iloc[i] > df['close'].iloc[i] and df['close'].iloc[i-1] > df['open'].iloc[i-1]: # Bull OB
+            if df['open'].iloc[i] > df['close'].iloc[i] and df['close'].iloc[i-1] > df['open'].iloc[i-1]:
                 if df['close'].iloc[-1] > df['open'].iloc[i]: return True, False
-            if df['open'].iloc[i] < df['close'].iloc[i] and df['close'].iloc[i-1] < df['open'].iloc[i-1]: # Bear OB
+            if df['open'].iloc[i] < df['close'].iloc[i] and df['close'].iloc[i-1] < df['open'].iloc[i-1]:
                 if df['close'].iloc[-1] < df['open'].iloc[i]: return False, True
     return False, False
 
 # ── DATA PIPELINE ────────────────────────────────────────────
 async def fetch_ohlcv_safe(exchange, symbol, tf, limit):
     try:
-        data = await asyncio.wait_for(exchange.fetch_ohlcv(symbol, tf, limit=limit), timeout=10.0)
+        data = await asyncio.wait_for(exchange.fetch_ohlcv(symbol, tf, limit=limit), timeout=15.0)
         if data and len(data) >= CANDLES_REQUIRED:
             return pd.DataFrame(data, columns=['timestamp','open','high','low','close','volume'])
     except: pass
@@ -178,7 +174,7 @@ def build_indicators(df):
         'swing_high': round(sw['swing_high'], 6), 'swing_low': round(sw['swing_low'], 6),
         'z_score': round(z, 2), 'macd_hist': float(calc_macd(c)[2].iloc[-1]),
         'ema_f': float(calc_ema(c, EMA_FAST).iloc[-1]), 'ema_s': float(calc_ema(c, EMA_SLOW).iloc[-1]),
-        'adx': calc_adx(df), 'true_rvol': true_rvol, '_df': df # Simpan df untuk SMC scan
+        'adx': calc_adx(df), 'true_rvol': true_rvol, '_df': df
     }
 
 async def phase1_scan(exchange, coin):
@@ -243,7 +239,7 @@ def finalize_screener(c):
     c['Sideways'] = is_side
     c['Is_Cancel'] = is_cancel
     
-    # ── CONVICTION SCORE (Persis Pine Script v7.1) ──────────
+    # ── CONVICTION SCORE ────────────────────────────────────
     is_long = comp > 0
     df_smc = c.get('_df_1h') or c.get('_df_15m')
     
@@ -253,7 +249,6 @@ def finalize_screener(c):
         has_fvg_bull, has_fvg_bear = detect_fvg_simple(df_smc)
         has_ob_bull, has_ob_bear = detect_ob_simple(df_smc)
 
-    # Checklist Logic
     has_fvg = (has_fvg_bull and is_long) or (has_fvg_bear and not is_long)
     has_ob  = (has_ob_bull and is_long) or (has_ob_bear and not is_long)
     
@@ -268,14 +263,13 @@ def finalize_screener(c):
     
     conv = max(0, min(100, conv))
     c['Conviction'] = conv
-    c['Checklist'] = int(has_fvg) + int(aligned) + int(not is_side) + int(not c.get('Wild_Long', True)) + int(conv >= CONV_VALID)
+    c['Checklist'] = int(has_fvg) + int(aligned) + int(not is_side) + int(conv >= CONV_VALID) + int(has_ob)
     
-    # Tier Assignment
     if is_cancel or conv < CONV_VALID:
         c['Tier'] = "REJECT"
-    elif conv >= CONV_INST and c['Checklist'] >= 7:
+    elif conv >= CONV_INST and c['Checklist'] >= 5:
         c['Tier'] = "INSTITUTIONAL"
-    elif conv >= CONV_VALID and c['Checklist'] >= 5:
+    elif conv >= CONV_VALID and c['Checklist'] >= 4:
         c['Tier'] = "VALID"
     else:
         c['Tier'] = "WEAK"
@@ -303,7 +297,21 @@ def filter_by_correlation(candidates):
     return kept
 
 async def get_screener_data():
-    exchange = ccxt.gate({'options': {'defaultType': 'swap'}, 'enableRateLimit': True})
+    # BYBIT ANTI-BLOKIR: Inject custom session User-Agent
+    session = req_lib.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    })
+    
+    exchange = ccxt.bybit({
+        'apiKey': BYBIT_API_KEY,
+        'secret': BYBIT_SECRET,
+        'options': {'defaultType': 'swap'},
+        'enableRateLimit': True,
+        'timeout': 30000,
+        'session': session
+    })
+    
     try:
         tickers = await exchange.fetch_tickers()
         all_vols = [float(v.get('quoteVolume', 0)) for v in tickers.values() if float(v.get('quoteVolume', 0)) > 0]
@@ -323,24 +331,19 @@ async def get_screener_data():
     finally:
         await exchange.close()
 
-# ── TELEGRAM MESSAGE BUILDER ────────────────────────────────
+# ── TELEGRAM BUILDER ────────────────────────────────────────
 def build_screener_message(data_list):
-    # Filter hanya yang tidak reject
     valid_coins = [d for d in data_list if d['Tier'] != "REJECT"]
-    
     if not valid_coins:
         return "😴 *SCREENER RESULTS*\nSemua koin filter out (Sideways/Counter-trend).\nMarket sedang tidak bersahabat untuk intraday."
 
-    msg = "🔬 *SCREENER RESULTS (Buka chart & cocokkan dengan Pine v7.1)*\n"
-    msg += "Prioritaskan koin berlabel INST/VALID dengan Conviction tinggi.\n\n"
+    msg = "🔬 *SCREENER RESULTS (Buka chart & cocokkan dengan Pine v7.1)*\nPrioritaskan koin berlabel INST/VALID dengan Conviction tinggi.\n\n"
     
-    for i, d in enumerate(valid_coins[:5], 1): # Batasi 5 koin
+    for i, d in enumerate(valid_coins[:5], 1):
         direction = "🟢 LONG" if d['Composite'] > 0 else "🔴 SHORT"
         aln_badge = "✅3TF" if d['Aligned'] else "⚡2TF"
         rvol = d.get('True_RVOL', 0)
         rvol_badge = f" 📈{rvol:.1f}x" if rvol >= 1.5 else ""
-        
-        # Tier Badge
         tier = d['Tier']
         tier_emoji = "💎" if tier == "INSTITUTIONAL" else "✅" if tier == "VALID" else "⚠️"
         tier_text = f"{tier_emoji} *[{tier}]*" if tier in ["INSTITUTIONAL", "VALID"] else f"{tier_emoji} {tier}"
@@ -371,6 +374,10 @@ async def send_telegram(text):
 async def main():
     ts = datetime.now().strftime("%d %b %Y, %H:%M WIB")
     
+    if not all([BYBIT_API_KEY, BYBIT_SECRET]):
+        await send_telegram("❌ *ERROR*\nAPI Key Bybit belum di-set di GitHub Secrets.")
+        return
+
     if is_weekend_blackout():
         await send_telegram(f"😴 *SCREENER BLACKOUT*\n🕐 {ts}\n⛔ Weekend — Bot istirahat.")
         return
@@ -379,7 +386,7 @@ async def main():
     data = await get_screener_data()
     
     if not data:
-        await send_telegram("⚠️ Screener gagal mengambil data.")
+        await send_telegram("⚠️ Screener gagal mengambil data (Kemungkinan diblokir Bybit).")
         return
 
     n_inst = sum(1 for d in data if d['Tier'] == "INSTITUTIONAL")
