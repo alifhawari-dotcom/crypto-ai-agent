@@ -23,8 +23,10 @@ jobs:
       - name: Install Dependencies
         run: pip install ccxt aiohttp pandas numpy
       - name: Run Screener
+            - name: Run Screener
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          # GEMINI_API_KEY TIDAK DIPERLUKAN LAGI
+          BYBIT_API_KEY: ${{ secrets.BYBIT_API_KEY }}
+          BYBIT_API_SECRET: ${{ secrets.BYBIT_API_SECRET }}
         run: python screener.py
