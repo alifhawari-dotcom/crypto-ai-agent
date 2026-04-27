@@ -1,21 +1,17 @@
-name: Apex Quant v6.2 Sniper & Auditor
+name: Apex Quant v7.1 Screener
 
 on:
   schedule:
-    # Menjalankan Bot otomatis setiap 3 jam (00:00, 03:00, 06:00, dst dalam UTC)
-    - cron: "0 */2 * * *"  
-    # Alert penutupan posisi sebelum tidur (15:30 UTC / 22:30 WIB)
-    - cron: "30 15 * * *"  
-  workflow_dispatch:       # Tombol manual di tab Actions (Bisa pilih jalankan Bot atau Audit)
+    # Screener berjalan setiap 4 jam (00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC)
+    - cron: "0 */4 * * *"  
+  workflow_dispatch: # Tombol manual jika ingin scan dadakan
 
-# Mencegah bot berjalan double jika jadwal berhimpitan
 concurrency:
-  group: apex-quant-flow
+  group: apex-screener-flow
   cancel-in-progress: true
 
 jobs:
-  # JOB 1: Eksekusi Bot Trading (Berjalan Otomatis & Manual)
-  trading_job:
+  screener_job:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
@@ -26,40 +22,9 @@ jobs:
           python-version: '3.11'
       - name: Install Dependencies
         run: pip install ccxt aiohttp pandas numpy
-      - name: Run Apex Quant v6.2
+      - name: Run Screener
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python bot.py
-      - name: Save Trading Logs
-        run: |
-          git config --global user.name "Apex-Logger"
-          git config --global user.email "bot@apexquant.ai"
-          git add trade_history.csv || echo "No changes"
-          git commit -m "Update trade history [skip ci]" || echo "No changes"
-          git push
-
-  # JOB 2: Auditor Jurnal (HANYA berjalan jika diklik MANUAL)
-  audit_job:
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - name: Install Dependencies
-        run: pip install ccxt pandas numpy aiohttp
-      - name: Run Evaluator
-        run: python evaluator.py
-      - name: Save Audit Results
-        run: |
-          git config --global user.name "Bot-Auditor"
-          git config --global user.email "auditor@apexquant.ai"
-          git add trade_history.csv || echo "No changes"
-          git commit -m "Audit results (Win/Loss) [skip ci]" || echo "No changes"
-          git push
-          
+          # GEMINI_API_KEY TIDAK DIPERLUKAN LAGI
+        run: python screener.py
