@@ -2,7 +2,6 @@ import os
 import asyncio
 import logging
 import aiohttp
-import ccxt.async_support as ccxt
 import pandas as pd
 import numpy as np
 from datetime import datetime
@@ -32,6 +31,8 @@ WEEKEND_BLACKOUT  = True
 CONV_VALID        = 55
 CONV_HIGH         = 60
 CONV_INST         = 75
+
+TF_MAP = {'5m':'5','15m':'15','1h':'60'}
 
 # ── INDICATORS ────────────────────────────────────────────────
 def calc_atr(df, period=14):
@@ -161,13 +162,26 @@ def detect_ob_simple(df, lookback=10):
     return False, False
 
 # ── DATA PIPELINE ─────────────────────────────────────────────
-async def fetch_ohlcv_safe(exchange, symbol, tf, limit):
+async def fetch_ohlcv_safe(symbol, tf, limit):
+    """Fetch OHLCV langsung dari Bybit REST API — zero ccxt, zero load_markets."""
+    bybit_sym  = symbol.replace('/', '').replace(':USDT', '').upper()
+    interval   = TF_MAP.get(tf, '15')
+    url        = "https://api.bybit.com/v5/market/kline"
+    params     = {"category": "linear", "symbol": bybit_sym, "interval": interval, "limit": str(limit)}
     for attempt in range(MAX_RETRIES):
         try:
-            data = await asyncio.wait_for(
-                exchange.fetch_ohlcv(symbol, tf, limit=limit), timeout=15.0)
-            if data and len(data) >= CANDLES_REQUIRED:
-                return pd.DataFrame(data, columns=['timestamp','open','high','low','close','volume'])
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params,
+                                       timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        rows = data.get('result', {}).get('list', [])
+                        if rows and len(rows) >= CANDLES_REQUIRED:
+                            rows = list(reversed(rows))
+                            df = pd.DataFrame(rows, columns=['timestamp','open','high','low','close','volume','turnover'])
+                            for col in ['open','high','low','close','volume']:
+                                df[col] = pd.to_numeric(df[col], errors='coerce')
+                            return df[['timestamp','open','high','low','close','volume']]
         except Exception:
             if attempt < MAX_RETRIES - 1:
                 await asyncio.sleep(RETRY_DELAY)
@@ -204,10 +218,9 @@ def build_indicators(df):
         '_df':          df
     }
 
-async def phase1_scan(bybit, coin):
-    # Konversi simbol Binance ke Bybit: BTC/USDT:USDT -> BTC/USDT
-    symbol = coin['symbol'].replace(':USDT', '')
-    df = await fetch_ohlcv_safe(bybit, symbol, '15m', CANDLES_REQUIRED)
+async def phase1_scan(coin):
+    symbol = coin['symbol']
+    df = await fetch_ohlcv_safe(symbol, '15m', CANDLES_REQUIRED)
     if df is None:
         return None
     i = build_indicators(df)
@@ -226,12 +239,12 @@ async def phase1_scan(bybit, coin):
         '_df_15m':        i['_df']
     }
 
-async def phase2_enrich(bybit, c):
+async def phase2_enrich(c):
     await asyncio.sleep(PHASE2_DELAY)
-    symbol = c['symbol'].replace(':USDT', '')
+    symbol = c['symbol']
     df_1h, df_5m = await asyncio.gather(
-        fetch_ohlcv_safe(bybit, symbol, '1h', CANDLES_REQUIRED),
-        fetch_ohlcv_safe(bybit, symbol, '5m', CANDLES_REQUIRED)
+        fetch_ohlcv_safe(symbol, '1h', CANDLES_REQUIRED),
+        fetch_ohlcv_safe(symbol, '5m', CANDLES_REQUIRED)
     )
     if df_1h is not None:
         i1    = build_indicators(df_1h)
@@ -293,32 +306,31 @@ def finalize_screener(c):
     if aligned:
         comp += 5 if comp > 0 else -5
 
-    adx_val   = max(c.get('ADX_1h', 0.0), c.get('ADX_15m', 0.0))
-    is_side   = adx_val < (ADX_MIN_NUCLEAR if is_nuclear else ADX_MIN_NORMAL) and not is_nuclear
+    adx_val  = max(c.get('ADX_1h', 0.0), c.get('ADX_15m', 0.0))
+    is_side  = adx_val < (ADX_MIN_NUCLEAR if is_nuclear else ADX_MIN_NORMAL) and not is_nuclear
     is_cancel = ((trend == 'DOWNTREND' and comp > 0) or
                  (trend == 'UPTREND'   and comp < 0) or is_side)
 
-    c['Composite']  = round(comp, 1)
-    c['Matrix_Sync'] = ("FULL BULL" if comp >= 40 else
+    c.update({
+        'Composite':  round(comp, 1),
+        'Aligned':    aligned,
+        'ADX':        adx_val,
+        'Sideways':   is_side,
+        'Is_Cancel':  is_cancel,
+        'Matrix_Sync': ("FULL BULL" if comp >= 40 else
                         "BULLISH"   if comp > 10  else
                         "FULL BEAR" if comp <= -40 else
                         "BEARISH"   if comp < -10  else "NEUTRAL")
-    c['Aligned']    = aligned
-    c['ADX']        = adx_val
-    c['Sideways']   = is_side
-    c['Is_Cancel']  = is_cancel
+    })
 
-    # ── CONVICTION SCORE ──────────────────────────────────────
-    # FIX: Tidak pakai 'or' langsung pada DataFrame (ValueError pandas)
     is_long = comp > 0
     _df_1h  = c.get('_df_1h')
     _df_15m = c.get('_df_15m')
+    df_smc  = None
     if _df_1h is not None and not _df_1h.empty:
         df_smc = _df_1h
     elif _df_15m is not None and not _df_15m.empty:
         df_smc = _df_15m
-    else:
-        df_smc = None
 
     has_fvg_bull, has_fvg_bear = False, False
     has_ob_bull,  has_ob_bear  = False, False
@@ -351,7 +363,6 @@ def finalize_screener(c):
         c['Tier'] = "VALID"
     else:
         c['Tier'] = "WEAK"
-
     return c
 
 def filter_by_correlation(candidates):
@@ -382,73 +393,86 @@ def filter_by_correlation(candidates):
     return kept
 
 async def get_screener_data():
-    # ANTI-BLOKIR: Ticker dari Binance (public, bebas blokir)
-    #              OHLCV candle dari Bybit (endpoint public, tidak diblokir)
-    logging.info("Mengambil ticker dari Binance...")
-    binance = ccxt.binance({
-        'enableRateLimit': True,
-        'options': {'defaultType': 'future'}
-    })
-    bybit = ccxt.bybit({
-        'enableRateLimit': True,
-        'options': {
-            'defaultType':     'swap',
-            'fetchCurrencies': False,
-        }
-    })
-
+    # ZERO CCXT — langsung hit Bybit public REST API
+    # /v5/market/tickers dan /v5/market/kline = public endpoints, tidak diblokir
+    logging.info("Mengambil tickers dari Bybit public API...")
     try:
-        tickers  = await binance.fetch_tickers()
-        all_vols = [float(v.get('quoteVolume', 0))
-                    for v in tickers.values()
-                    if float(v.get('quoteVolume', 0)) > 0]
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://api.bybit.com/v5/market/tickers",
+                params={"category": "linear"},
+                timeout=aiohttp.ClientTimeout(total=20)
+            ) as resp:
+                if resp.status != 200:
+                    raise Exception(f"HTTP {resp.status}")
+                data = await resp.json()
+
+        if data.get('retMsg') != 'OK':
+            raise Exception("API Error: " + str(data.get('retMsg')))
+
+        result_list = data.get('result', {}).get('list', [])
+        if not result_list:
+            raise Exception("Empty ticker list")
+
+        all_tickers = []
+        for item in result_list:
+            sym = item.get('symbol', '')
+            if not sym.endswith('USDT'):
+                continue
+            all_tickers.append({
+                'symbol':      sym + ':USDT',
+                'last':        float(item.get('lastPrice', 0) or 0),
+                'quoteVolume': float(item.get('volume24h', 0) or 0),
+                'percentage':  float(item.get('price24hPcnt', 0) or 0),
+            })
+
+        all_vols        = [t['quoteVolume'] for t in all_tickers if t['quoteVolume'] > 0]
         dynamic_min_vol = (max(5_000_000, np.percentile(all_vols, 70) * 0.5)
                            if all_vols else 7_000_000)
-        liquid = [v for v in tickers.values()
-                  if float(v.get('quoteVolume', 0)) >= dynamic_min_vol
-                  and v.get('last')]
-        for v in liquid:
-            v['_rvol'] = compute_rvol(v)
+        liquid = [t for t in all_tickers
+                  if t['quoteVolume'] >= dynamic_min_vol and t['last'] > 0]
+        for t in liquid:
+            t['_rvol'] = compute_rvol(t)
 
-        # Hanya ambil pair USDT Perpetual
-        top = [v for v in sorted(liquid, key=lambda x: x['_rvol'], reverse=True)[:TOP_COINS_BY_RVOL]
-               if ':USDT' in v.get('symbol', '')]
-
-        logging.info(f"Universe: {len(tickers)} → Top {len(top)} liquid. Fetch OHLCV dari Bybit...")
+        top = sorted(liquid, key=lambda x: x['_rvol'], reverse=True)[:TOP_COINS_BY_RVOL]
+        logging.info(f"Universe: {len(all_tickers)} → Top {len(top)} liquid. Fetch OHLCV...")
 
         # Phase 1
         sem1 = asyncio.Semaphore(SEMAPHORE_P1)
         async def sp1(coin):
             async with sem1:
-                return await phase1_scan(bybit, coin)
+                return await phase1_scan(coin)
         p1    = await asyncio.gather(*[sp1(c) for c in top])
         cands = sorted([r for r in p1 if r],
                        key=lambda x: abs(x['power_15m']), reverse=True)[:RANKED_CANDIDATES]
+
+        if not cands:
+            logging.warning("Tidak ada candle berhasil di-fetch.")
+            return []
 
         # Phase 2
         sem2 = asyncio.Semaphore(SEMAPHORE_P2)
         async def sp2(c):
             async with sem2:
-                return await phase2_enrich(bybit, c)
+                return await phase2_enrich(c)
         enriched  = await asyncio.gather(*[sp2(c) for c in cands])
         finalized = sorted([finalize_screener(c) for c in enriched],
                            key=lambda x: x['Conviction'], reverse=True)
         return filter_by_correlation(finalized)
-    finally:
-        await binance.close()
-        await bybit.close()
 
-# ── TELEGRAM BUILDER ──────────────────────────────────────────
+    except Exception as e:
+        logging.error(f"Gagal fetch data: {e}")
+        return []
+
+# ── TELEGRAM ──────────────────────────────────────────────────
 def build_screener_message(data_list):
     valid_coins = [d for d in data_list if d['Tier'] != "REJECT"]
     if not valid_coins:
         return ("😴 *SCREENER RESULTS*\n"
                 "Semua koin filter out (Sideways/Counter-trend).\n"
                 "Market sedang tidak bersahabat untuk intraday.")
-
     msg = ("🔬 *SCREENER RESULTS (Buka chart & cocokkan dengan Pine v7.1)*\n"
            "Prioritaskan koin berlabel INST/VALID dengan Conviction tinggi.\n\n")
-
     for i, d in enumerate(valid_coins[:5], 1):
         direction  = "🟢 LONG"  if d['Composite'] > 0 else "🔴 SHORT"
         aln_badge  = "✅3TF"    if d['Aligned']        else "⚡2TF"
@@ -493,14 +517,14 @@ async def main():
     data = await get_screener_data()
 
     if not data:
-        await send_telegram("⚠️ Screener gagal mengambil data.")
+        await send_telegram("⚠️ Gagal mengambil data dari Bybit API.")
         return
 
     n_inst  = sum(1 for d in data if d['Tier'] == "INSTITUTIONAL")
     n_valid = sum(1 for d in data if d['Tier'] == "VALID")
 
     header = (f"👁️ *GOD MODE SCREENER v7.1*\n"
-              f"🕐 {ts} | Binance Ticker + Bybit OHLCV\n"
+              f"🕐 {ts} | Bybit Raw API (Zero CCXT)\n"
               f"📊 Scanned: {len(data)} | 💎 INST: {n_inst} | ✅ VALID: {n_valid}\n"
               f"{'─' * 35}\n\n")
 
