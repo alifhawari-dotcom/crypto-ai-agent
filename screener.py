@@ -1,0 +1,310 @@
+import os
+import asyncio
+import logging
+import aiohttp
+import ccxt.async_support as ccxt
+import pandas as pd
+import numpy as np
+from datetime import datetime
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+TG_TOKEN   = os.getenv('TELEGRAM_TOKEN')
+TG_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+
+# ── CONSTANTS ────────────────────────────────────────────────
+TOP_COINS_BY_RVOL   = 50
+RANKED_CANDIDATES   = 12
+CANDLES_REQUIRED    = 100
+ADX_PERIOD          = 14
+ADX_MIN_NUCLEAR     = 18.0
+ADX_MIN_NORMAL      = 22.0
+CORR_WINDOW         = 30
+CORR_THRESHOLD      = 0.78
+EMA_FAST, EMA_SLOW   = 20, 50
+SWING_LOOKBACK      = 10
+SEMAPHORE_P1        = 5
+SEMAPHORE_P2        = 3
+PHASE2_DELAY        = 0.3
+MAX_RETRIES         = 3
+RETRY_DELAY         = 5
+WEEKEND_BLACKOUT    = True
+
+# ── INDICATORS (Identical dengan bot utama) ─────────────────
+def calc_atr(df, period=14):
+    high, low, pc = df['high'], df['low'], df['close'].shift(1)
+    tr = pd.concat([high-low, (high-pc).abs(), (low-pc).abs()], axis=1).max(axis=1)
+    median = tr.rolling(50, min_periods=1).median()
+    clean = pd.Series(np.where(tr > median * 4, median, tr), index=df.index)
+    return clean.rolling(period).mean()
+
+def calc_rsi(close, period=14):
+    d = close.diff()
+    gain = d.where(d > 0, 0).ewm(alpha=1/period, adjust=False).mean()
+    loss = (-d.where(d < 0, 0)).ewm(alpha=1/period, adjust=False).mean()
+    return 100 - (100 / (1 + gain / np.where(loss == 0, 1e-9, loss)))
+
+def calc_ema(close, span):
+    return close.ewm(span=span, adjust=False).mean()
+
+def calc_macd(close):
+    m = calc_ema(close, 12) - calc_ema(close, 26)
+    s = m.ewm(span=9, adjust=False).mean()
+    return m, s, m - s
+
+def calc_squeeze(df, atr):
+    mean = df['close'].rolling(20).mean()
+    sd = df['close'].rolling(20).std()
+    return (mean + 2*sd < mean + 1.5*atr) & (mean - 2*sd > mean - 1.5*atr)
+
+def calc_adx(df, period=14):
+    high, low = df['high'], df['low']
+    up, down = high.diff(), -low.diff()
+    pDM = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=df.index)
+    mDM = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=df.index)
+    atr_raw = calc_atr(df, period).replace(0, np.nan)
+    pDI = 100 * (pDM.ewm(alpha=1/period, adjust=False).mean() / atr_raw)
+    mDI = 100 * (mDM.ewm(alpha=1/period, adjust=False).mean() / atr_raw)
+    dxDenom = (pDI + mDI).replace(0, np.nan)
+    dx = 100 * (pDI - mDI).abs() / dxDenom
+    val = float(dx.ewm(alpha=1/period, adjust=False).mean().iloc[-1])
+    return round(val, 1) if not np.isnan(val) else 0.0
+
+def _find_swings(highs, lows, lookback):
+    sh, sl = [], []
+    n = len(highs)
+    for i in range(lookback, n - lookback):
+        lh, rh = highs[i-lookback:i], highs[i+1:i+lookback+1]
+        ll, rl = lows[i-lookback:i], lows[i+1:i+lookback+1]
+        if len(lh) == lookback and len(rh) == lookback and highs[i] >= max(lh) and highs[i] >= max(rh):
+            sh.append(float(highs[i]))
+        if len(ll) == lookback and len(rl) == lookback and lows[i] <= min(ll) and lows[i] <= min(rl):
+            sl.append(float(lows[i]))
+    return sh, sl
+
+def calc_swing_levels(df, lookback=10):
+    highs, lows = df['high'].values, df['low'].values
+    for lb in range(lookback, 2, -1):
+        sh, sl = _find_swings(highs, lows, lb)
+        if sh and sl: return {'swing_high': sh[-1], 'swing_low': sl[-1]}
+    return {'swing_high': float(df['high'].rolling(20).max().iloc[-1]), 'swing_low': float(df['low'].rolling(20).min().iloc[-1])}
+
+def is_weekend_blackout():
+    if not WEEKEND_BLACKOUT: return False
+    now = datetime.utcnow()
+    overflow = (now.hour + 7) >= 24
+    wd = (now.weekday() + (1 if overflow else 0)) % 7
+    hh = (now.hour + 7) % 24
+    if wd == 4 and hh >= 20: return True
+    if wd in (5, 6): return True
+    if wd == 0 and hh < 9: return True
+    return False
+
+def compute_rvol(ticker):
+    vol = float(ticker.get('quoteVolume') or 0)
+    chg = abs(float(ticker.get('percentage') or ticker.get('change') or 0))
+    last = float(ticker.get('last') or 1e-9)
+    return (vol * max(chg, 0.1)) / last
+
+# ── DATA PIPELINE ────────────────────────────────────────────
+async def fetch_ohlcv_safe(exchange, symbol, tf, limit):
+    try:
+        data = await asyncio.wait_for(exchange.fetch_ohlcv(symbol, tf, limit=limit), timeout=10.0)
+        if data and len(data) >= CANDLES_REQUIRED:
+            return pd.DataFrame(data, columns=['timestamp','open','high','low','close','volume'])
+    except: pass
+    return None
+
+def build_indicators(df):
+    c, h, l, v = df['close'], df['high'], df['low'], df['volume']
+    atr = calc_atr(df)
+    rng = h - l
+    nd = pd.Series(np.where(rng==0, 0, ((c-l)-(h-c))/rng*v), index=df.index)
+    ad = nd.abs().rolling(20).mean()
+    sf = np.clip((nd / np.where(ad==0, 1, ad)) * 20, -40, 40)
+    rsi = calc_rsi(c)
+    ps = sf + np.clip((rsi-50)*1.2, -30, 30)
+    sw = calc_swing_levels(df)
+    vm = v.rolling(20).mean().iloc[-1]
+    vs = v.rolling(20).std().iloc[-1]
+    z = float((v.iloc[-1]-vm) / (vs if vs != 0 else 1))
+    true_rvol = round(float(v.iloc[-1] / max(vm, 1e-9)), 2)
+    return {
+        'close': float(c.iloc[-1]), 'power_score': round(float(ps.iloc[-1]), 1),
+        'rsi': round(float(rsi.iloc[-1]), 1), 'atr': round(float(atr.iloc[-1]), 6),
+        'is_squeezing': bool(calc_squeeze(df, atr).iloc[-1]),
+        'swing_high': round(sw['swing_high'], 6), 'swing_low': round(sw['swing_low'], 6),
+        'z_score': round(z, 2), 'macd_hist': float(calc_macd(c)[2].iloc[-1]),
+        'ema_f': float(calc_ema(c, EMA_FAST).iloc[-1]), 'ema_s': float(calc_ema(c, EMA_SLOW).iloc[-1]),
+        'adx': calc_adx(df), 'true_rvol': true_rvol,
+    }
+
+async def phase1_scan(exchange, coin):
+    df = await fetch_ohlcv_safe(exchange, coin['symbol'], '15m', CANDLES_REQUIRED)
+    if df is None: return None
+    i = build_indicators(df)
+    return {'symbol': coin['symbol'], 'Symbol': coin['symbol'].split(':')[0], 'Price': i['close'],
+            'power_15m': i['power_score'], 'RSI_15m': i['rsi'], 'ATR_15m': i['atr'],
+            'Squeeze_15m': i['is_squeezing'], 'Swing_High_15m': i['swing_high'],
+            'Swing_Low_15m': i['swing_low'], 'ADX_15m': i['adx'], 'rvol_score': coin.get('_rvol', 0.0)}
+
+async def phase2_enrich(exchange, c):
+    await asyncio.sleep(PHASE2_DELAY)
+    df_1h, df_5m = await asyncio.gather(
+        fetch_ohlcv_safe(exchange, c['symbol'], '1h', CANDLES_REQUIRED),
+        fetch_ohlcv_safe(exchange, c['symbol'], '5m', CANDLES_REQUIRED))
+    
+    if df_1h is not None:
+        i1 = build_indicators(df_1h)
+        p = i1['close']
+        trend = "UPTREND" if p > i1['ema_f'] > i1['ema_s'] else "DOWNTREND" if p < i1['ema_f'] < i1['ema_s'] else "RANGING"
+        c.update({'Trend_1h': trend, 'power_1h': i1['power_score'], 'ADX_1h': i1['adx'], 
+                  'rvol_score': i1['true_rvol'], 'True_RVOL': i1['true_rvol'],
+                  '_close_1h': df_1h['close'].values[-CORR_WINDOW:].tolist()})
+    else:
+        c.update({'Trend_1h': 'N/A', 'power_1h': c['power_15m'], 'ADX_1h': 0.0, 'True_RVOL': c.get('rvol_score', 0.0), '_close_1h': []})
+
+    if df_5m is not None:
+        i5 = build_indicators(df_5m)
+        z = i5['z_score']
+        sm_lvl = "NUCLEAR" if z > 3.0 else "ACTIVE" if z > 1.5 else "QUIET"
+        sm_sig = "💥NUC+SQZ" if sm_lvl == "NUCLEAR" and i5['is_squeezing'] else "🐳NUCLEAR" if sm_lvl == "NUCLEAR" else "🔥SQUEEZE" if i5['is_squeezing'] else "👀ACTIVE" if sm_lvl == "ACTIVE" else "😴QUIET"
+        c.update({'z_score_5m': z, 'SM_Signal': sm_sig, 'power_5m': i5['power_score']})
+    else:
+        c.update({'z_score_5m': 0.0, 'SM_Signal': '😴QUIET', 'power_5m': c['power_15m']})
+    return c
+
+def finalize_screener(c):
+    # Hitung Score persis seperti bot utama
+    p15, p1h, p5m = c['power_15m'], c.get('power_1h', c['power_15m']), c.get('power_5m', c['power_15m'])
+    comp = (p1h * 0.40) + (p15 * 0.40) + (p5m * 0.20)
+    trend = c.get('Trend_1h', 'RANGING')
+    td_dir = 1 if trend == 'UPTREND' else -1 if trend == 'DOWNTREND' else 0
+    if td_dir != 0 and (1 if p15 > 0 else -1) != td_dir: comp -= 15
+    
+    sm_lvl = c.get('SM_Signal', '😴QUIET')
+    is_nuclear = 'NUC' in sm_lvl
+    sm_bonus = 23 if 'NUC+SQZ' in sm_lvl else 15 if is_nuclear else 7 if 'ACTIVE' in sm_lvl else 0
+    if sm_bonus > 0: comp += sm_bonus if comp > 0 else -sm_bonus
+
+    aligned = (p5m>0 and p15>0 and p1h>0) or (p5m<0 and p15<0 and p1h<0)
+    if aligned: comp += 5 if comp > 0 else -5
+
+    adx_val = max(c.get('ADX_1h', 0.0), c.get('ADX_15m', 0.0))
+    is_side = adx_val < (ADX_MIN_NUCLEAR if is_nuclear else ADX_MIN_NORMAL) and not is_nuclear
+    is_cancel = (trend == 'DOWNTREND' and comp > 0) or (trend == 'UPTREND' and comp < 0) or is_side
+
+    c['Composite'] = round(comp, 1)
+    c['Matrix_Sync'] = "FULL BULL" if comp >= 40 else "BULLISH" if comp > 10 else "FULL BEAR" if comp <= -40 else "BEARISH" if comp < -10 else "NEUTRAL"
+    c['Aligned'] = aligned
+    c['ADX'] = adx_val
+    c['Sideways'] = is_side
+    c['Is_Cancel'] = is_cancel
+    return c
+
+def filter_by_correlation(candidates):
+    if len(candidates) <= 1: return candidates
+    kept, series = [], {}
+    for c in candidates:
+        closes = c.get('_close_1h', [])
+        if len(closes) >= 10: series[c['symbol']] = np.array(closes[-CORR_WINDOW:], dtype=float)
+    for c in candidates:
+        sym, too_corr = c['symbol'], False
+        if sym in series:
+            for k in kept:
+                if k['symbol'] not in series: continue
+                s1, s2 = series[sym], series[k['symbol']]
+                n = min(len(s1), len(s2))
+                if n >= 10:
+                    corr = float(np.corrcoef(s1[-n:], s2[-n:])[0, 1])
+                    if not np.isnan(corr) and corr > CORR_THRESHOLD: too_corr = True; break
+        if not too_corr: kept.append(c)
+        if len(kept) >= 8: break
+    return kept
+
+async def get_screener_data():
+    exchange = ccxt.gate({'options': {'defaultType': 'swap'}, 'enableRateLimit': True})
+    try:
+        tickers = await exchange.fetch_tickers()
+        all_vols = [float(v.get('quoteVolume', 0)) for v in tickers.values() if float(v.get('quoteVolume', 0)) > 0]
+        dynamic_min_vol = max(5_000_000, np.percentile(all_vols, 70) * 0.5) if all_vols else 7_000_000
+        liquid = [v for v in tickers.values() if float(v.get('quoteVolume', 0)) >= dynamic_min_vol and v.get('last')]
+        for v in liquid: v['_rvol'] = compute_rvol(v)
+        
+        top = sorted(liquid, key=lambda x: x['_rvol'], reverse=True)[:TOP_COINS_BY_RVOL]
+        sem1 = asyncio.Semaphore(SEMAPHORE_P1)
+        p1 = await asyncio.gather(*[phase1_scan(exchange, c) for c in top])
+        cands = sorted([r for r in p1 if r], key=lambda x: abs(x['power_15m']), reverse=True)[:RANKED_CANDIDATES]
+        
+        sem2 = asyncio.Semaphore(SEMAPHORE_P2)
+        enriched = await asyncio.gather(*[phase2_enrich(exchange, c) for c in cands])
+        finalized = sorted([finalize_screener(c) for c in enriched], key=lambda x: abs(x['Composite']), reverse=True)
+        return filter_by_correlation(finalized)
+    finally:
+        await exchange.close()
+
+# ── TELEGRAM FORMAT SCREENER (Bukan Kartu Trade) ────────────
+def build_screener_message(data_list):
+    msg = "🔬 *SCREENER RESULTS (Confirm di TradingView)*\n"
+    msg += "Pilih 3-4 koin teratas, buka chart, pasang indikator Pine Script v7.1\n\n"
+    
+    valid_coins = [d for d in data_list if not d['Is_Cancel']]
+    if not valid_coins:
+        return "😴 *SCREENER RESULTS*\nSemua koin filter out (Sideways/Counter-trend).\nTidak ada yang perlu dianalisa saat ini."
+
+    for i, d in enumerate(valid_coins[:5], 1): # Batasi 5 koin teratas
+        direction = "🟢 LONG" if d['Composite'] > 0 else "🔴 SHORT"
+        aln_badge = "✅3TF" if d['Aligned'] else "⚡2TF"
+        rvol = d.get('True_RVOL', 0)
+        rvol_badge = f" 📈{rvol:.1f}x" if rvol >= 1.5 else ""
+        
+        msg += (
+            f"{i}. *{d['Symbol']}* — {direction} `{d['Matrix_Sync']}`\n"
+            f"   SM: {d['SM_Signal']} | ADX: `{d['ADX']}` {aln_badge}{rvol_badge}\n"
+            f"   1H: {d.get('Trend_1h', 'N/A')} | Score: `{d['Composite']}`\n\n"
+        )
+    return msg
+
+async def send_telegram(text):
+    if not all([TG_TOKEN, TG_CHAT_ID]): return
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
+    async with aiohttp.ClientSession() as session:
+        for chunk in chunks:
+            payload = {"chat_id": TG_CHAT_ID, "text": chunk, "parse_mode": "Markdown"}
+            try:
+                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    if resp.status == 400: # Fallback plain text
+                        payload.pop("parse_mode", None)
+                        await session.post(url, json=payload)
+            except Exception as e:
+                logging.error(f"TG Error: {e}")
+
+# ── MAIN ─────────────────────────────────────────────────────
+async def main():
+    ts = datetime.now().strftime("%d %b %Y, %H:%M WIB")
+    
+    if is_weekend_blackout():
+        await send_telegram(f"😴 *SCREENER BLACKOUT*\n🕐 {ts}\n⛔ Weekend — Bot istirahat.")
+        return
+
+    logging.info(f"🚀 Screener v7.1 dimulai...")
+    data = await get_screener_data()
+    
+    if not data:
+        await send_telegram("⚠️ Screener gagal mengambil data.")
+        return
+
+    n_valid = sum(1 for d in data if not d['Is_Cancel'])
+    header = (
+        f"👁️ *GOD MODE SCREENER v7.1*\n"
+        f"🕐 {ts} | Rule-Based (No API Limits)\n"
+        f"📊 Scanned: {len(data)} koin | Valid: {n_valid}\n"
+        f"{'─' * 30}\n\n"
+    )
+    
+    await send_telegram(header + build_screener_message(data))
+    logging.info(f"✅ Screener selesai. {n_valid} koin valid dikirim.")
+
+if __name__ == "__main__":
+    asyncio.run(main())
