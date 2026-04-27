@@ -392,12 +392,11 @@ def filter_by_correlation(candidates):
 async def get_screener_data():
     # FIX: Hapus 'session' kwarg — ccxt tidak support requests.Session
     exchange = ccxt.bybit({
-        'apiKey':    BYBIT_API_KEY,
-        'secret':    BYBIT_SECRET,
-        'options':   {'defaultType': 'swap'},
+        'apiKey':          BYBIT_API_KEY,
+        'secret':          BYBIT_SECRET,
+        'options':         {'defaultType': 'swap'},
         'enableRateLimit': True,
-        'timeout':   30000,
-        'headers':   {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        'timeout':         30000,
     })
 
     try:
