@@ -9,10 +9,10 @@ from datetime import datetime
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-TG_TOKEN       = os.getenv('TELEGRAM_TOKEN')
-TG_CHAT_ID     = os.getenv('TELEGRAM_CHAT_ID')
-BYBIT_API_KEY  = os.getenv('BYBIT_API_KEY')
-BYBIT_SECRET   = os.getenv('BYBIT_API_SECRET')
+TG_TOKEN       = (os.getenv('TELEGRAM_TOKEN')    or '').strip()
+TG_CHAT_ID     = (os.getenv('TELEGRAM_CHAT_ID')  or '').strip()
+BYBIT_API_KEY  = (os.getenv('BYBIT_API_KEY')     or '').strip()
+BYBIT_SECRET   = (os.getenv('BYBIT_API_SECRET')  or '').strip()
 
 # ── CONSTANTS ────────────────────────────────────────────────
 TOP_COINS_BY_RVOL   = 50
@@ -394,7 +394,10 @@ async def get_screener_data():
     exchange = ccxt.bybit({
         'apiKey':          BYBIT_API_KEY,
         'secret':          BYBIT_SECRET,
-        'options':         {'defaultType': 'swap'},
+        'options':         {
+            'defaultType': 'swap',
+            'fetchCurrencies': False,
+        },
         'enableRateLimit': True,
         'timeout':         30000,
     })
