@@ -30,7 +30,12 @@ MAX_RETRIES         = 3
 RETRY_DELAY         = 5
 WEEKEND_BLACKOUT    = True
 
-# ── INDICATORS (Identical dengan bot utama) ─────────────────
+# ── V7.1 TIER THRESHOLDS (Sama persis dengan Pine Script) ───
+CONV_VALID = 55
+CONV_HIGH  = 60
+CONV_INST  = 75
+
+# ── INDICATORS ───────────────────────────────────────────────
 def calc_atr(df, period=14):
     high, low, pc = df['high'], df['low'], df['close'].shift(1)
     tr = pd.concat([high-low, (high-pc).abs(), (low-pc).abs()], axis=1).max(axis=1)
@@ -44,8 +49,7 @@ def calc_rsi(close, period=14):
     loss = (-d.where(d < 0, 0)).ewm(alpha=1/period, adjust=False).mean()
     return 100 - (100 / (1 + gain / np.where(loss == 0, 1e-9, loss)))
 
-def calc_ema(close, span):
-    return close.ewm(span=span, adjust=False).mean()
+def calc_ema(close, span): return close.ewm(span=span, adjust=False).mean()
 
 def calc_macd(close):
     m = calc_ema(close, 12) - calc_ema(close, 26)
@@ -106,6 +110,44 @@ def compute_rvol(ticker):
     last = float(ticker.get('last') or 1e-9)
     return (vol * max(chg, 0.1)) / last
 
+# ── SMC DETECTORS (Lightweight, mendukung Pine Script v7.1) ─
+def detect_fvg_simple(df, lookback=20):
+    """Scan 1 FVG terdekat (bullish/bearish) tanpa nested loop."""
+    if len(df) < 5: return False, False
+    atr = calc_atr(df).iloc[-1]
+    if atr == 0: return False, False
+    min_size = atr * 0.3
+    
+    for i in range(2, min(lookback+1, len(df))):
+        # Bullish FVG
+        if df['low'].iloc[i-2] < df['low'].iloc[i] and (df['low'].iloc[i] - df['low'].iloc[i-2]) >= min_size:
+            if not (df['close'].iloc[i-1] <= df['low'].iloc[i] and df['close'].iloc[i-1] >= df['low'].iloc[i-2]):
+                return True, False
+        # Bearish FVG
+        if df['high'].iloc[i] < df['high'].iloc[i-2] and (df['high'].iloc[i-2] - df['high'].iloc[i]) >= min_size:
+            if not (df['close'].iloc[i-1] >= df['high'].iloc[i] and df['close'].iloc[i-1] <= df['high'].iloc[i-2]):
+                return False, True
+    return False, False
+
+def detect_ob_simple(df, lookback=10):
+    """Scan 1 Order Block terdekat dengan syarat impulse + volume."""
+    if len(df) < 5: return False, False
+    atr = calc_atr(df).iloc[-1]
+    if atr == 0: return False, False
+    vol_avg = df['volume'].rolling(20).mean().iloc[-1]
+    if vol_avg == 0: return False, False
+
+    for i in range(1, min(lookback+1, len(df)-1)):
+        imp = abs(df['close'].iloc[i-1] - df['close'].iloc[i])
+        vol_ok = df['volume'].iloc[i-1] > vol_avg * 1.5
+        
+        if imp > atr * 2.0 and vol_ok:
+            if df['open'].iloc[i] > df['close'].iloc[i] and df['close'].iloc[i-1] > df['open'].iloc[i-1]: # Bull OB
+                if df['close'].iloc[-1] > df['open'].iloc[i]: return True, False
+            if df['open'].iloc[i] < df['close'].iloc[i] and df['close'].iloc[i-1] < df['open'].iloc[i-1]: # Bear OB
+                if df['close'].iloc[-1] < df['open'].iloc[i]: return False, True
+    return False, False
+
 # ── DATA PIPELINE ────────────────────────────────────────────
 async def fetch_ohlcv_safe(exchange, symbol, tf, limit):
     try:
@@ -136,7 +178,7 @@ def build_indicators(df):
         'swing_high': round(sw['swing_high'], 6), 'swing_low': round(sw['swing_low'], 6),
         'z_score': round(z, 2), 'macd_hist': float(calc_macd(c)[2].iloc[-1]),
         'ema_f': float(calc_ema(c, EMA_FAST).iloc[-1]), 'ema_s': float(calc_ema(c, EMA_SLOW).iloc[-1]),
-        'adx': calc_adx(df), 'true_rvol': true_rvol,
+        'adx': calc_adx(df), 'true_rvol': true_rvol, '_df': df # Simpan df untuk SMC scan
     }
 
 async def phase1_scan(exchange, coin):
@@ -146,7 +188,8 @@ async def phase1_scan(exchange, coin):
     return {'symbol': coin['symbol'], 'Symbol': coin['symbol'].split(':')[0], 'Price': i['close'],
             'power_15m': i['power_score'], 'RSI_15m': i['rsi'], 'ATR_15m': i['atr'],
             'Squeeze_15m': i['is_squeezing'], 'Swing_High_15m': i['swing_high'],
-            'Swing_Low_15m': i['swing_low'], 'ADX_15m': i['adx'], 'rvol_score': coin.get('_rvol', 0.0)}
+            'Swing_Low_15m': i['swing_low'], 'ADX_15m': i['adx'], 'rvol_score': coin.get('_rvol', 0.0),
+            '_df_15m': i['_df']}
 
 async def phase2_enrich(exchange, c):
     await asyncio.sleep(PHASE2_DELAY)
@@ -160,22 +203,21 @@ async def phase2_enrich(exchange, c):
         trend = "UPTREND" if p > i1['ema_f'] > i1['ema_s'] else "DOWNTREND" if p < i1['ema_f'] < i1['ema_s'] else "RANGING"
         c.update({'Trend_1h': trend, 'power_1h': i1['power_score'], 'ADX_1h': i1['adx'], 
                   'rvol_score': i1['true_rvol'], 'True_RVOL': i1['true_rvol'],
-                  '_close_1h': df_1h['close'].values[-CORR_WINDOW:].tolist()})
+                  '_close_1h': df_1h['close'].values[-CORR_WINDOW:].tolist(),
+                  '_df_1h': i1['_df']})
     else:
-        c.update({'Trend_1h': 'N/A', 'power_1h': c['power_15m'], 'ADX_1h': 0.0, 'True_RVOL': c.get('rvol_score', 0.0), '_close_1h': []})
+        c.update({'Trend_1h': 'N/A', 'power_1h': c['power_15m'], 'ADX_1h': 0.0, 'True_RVOL': c.get('rvol_score', 0.0), '_close_1h': [], '_df_1h': None})
 
     if df_5m is not None:
         i5 = build_indicators(df_5m)
         z = i5['z_score']
-        sm_lvl = "NUCLEAR" if z > 3.0 else "ACTIVE" if z > 1.5 else "QUIET"
-        sm_sig = "💥NUC+SQZ" if sm_lvl == "NUCLEAR" and i5['is_squeezing'] else "🐳NUCLEAR" if sm_lvl == "NUCLEAR" else "🔥SQUEEZE" if i5['is_squeezing'] else "👀ACTIVE" if sm_lvl == "ACTIVE" else "😴QUIET"
+        sm_sig = "💥NUC+SQZ" if z > 3.0 and i5['is_squeezing'] else "🐳NUCLEAR" if z > 3.0 else "🔥SQUEEZE" if i5['is_squeezing'] else "👀ACTIVE" if z > 1.5 else "😴QUIET"
         c.update({'z_score_5m': z, 'SM_Signal': sm_sig, 'power_5m': i5['power_score']})
     else:
         c.update({'z_score_5m': 0.0, 'SM_Signal': '😴QUIET', 'power_5m': c['power_15m']})
     return c
 
 def finalize_screener(c):
-    # Hitung Score persis seperti bot utama
     p15, p1h, p5m = c['power_15m'], c.get('power_1h', c['power_15m']), c.get('power_5m', c['power_15m'])
     comp = (p1h * 0.40) + (p15 * 0.40) + (p5m * 0.20)
     trend = c.get('Trend_1h', 'RANGING')
@@ -200,6 +242,44 @@ def finalize_screener(c):
     c['ADX'] = adx_val
     c['Sideways'] = is_side
     c['Is_Cancel'] = is_cancel
+    
+    # ── CONVICTION SCORE (Persis Pine Script v7.1) ──────────
+    is_long = comp > 0
+    df_smc = c.get('_df_1h') or c.get('_df_15m')
+    
+    has_fvg_bull, has_fvg_bear = False, False
+    has_ob_bull, has_ob_bear = False, False
+    if df_smc is not None:
+        has_fvg_bull, has_fvg_bear = detect_fvg_simple(df_smc)
+        has_ob_bull, has_ob_bear = detect_ob_simple(df_smc)
+
+    # Checklist Logic
+    has_fvg = (has_fvg_bull and is_long) or (has_fvg_bear and not is_long)
+    has_ob  = (has_ob_bull and is_long) or (has_ob_bear and not is_long)
+    
+    conv = 0
+    if has_fvg: conv += 20
+    if aligned: conv += 12
+    if is_nuclear: conv += 15
+    if adx_val > 25: conv += 10
+    elif adx_val < 18: conv -= 30
+    if c['Squeeze_15m']: conv += 8
+    if has_ob: conv += 8
+    
+    conv = max(0, min(100, conv))
+    c['Conviction'] = conv
+    c['Checklist'] = int(has_fvg) + int(aligned) + int(not is_side) + int(not c.get('Wild_Long', True)) + int(conv >= CONV_VALID)
+    
+    # Tier Assignment
+    if is_cancel or conv < CONV_VALID:
+        c['Tier'] = "REJECT"
+    elif conv >= CONV_INST and c['Checklist'] >= 7:
+        c['Tier'] = "INSTITUTIONAL"
+    elif conv >= CONV_VALID and c['Checklist'] >= 5:
+        c['Tier'] = "VALID"
+    else:
+        c['Tier'] = "WEAK"
+        
     return c
 
 def filter_by_correlation(candidates):
@@ -238,30 +318,37 @@ async def get_screener_data():
         
         sem2 = asyncio.Semaphore(SEMAPHORE_P2)
         enriched = await asyncio.gather(*[phase2_enrich(exchange, c) for c in cands])
-        finalized = sorted([finalize_screener(c) for c in enriched], key=lambda x: abs(x['Composite']), reverse=True)
+        finalized = sorted([finalize_screener(c) for c in enriched], key=lambda x: x['Conviction'], reverse=True)
         return filter_by_correlation(finalized)
     finally:
         await exchange.close()
 
-# ── TELEGRAM FORMAT SCREENER (Bukan Kartu Trade) ────────────
+# ── TELEGRAM MESSAGE BUILDER ────────────────────────────────
 def build_screener_message(data_list):
-    msg = "🔬 *SCREENER RESULTS (Confirm di TradingView)*\n"
-    msg += "Pilih 3-4 koin teratas, buka chart, pasang indikator Pine Script v7.1\n\n"
+    # Filter hanya yang tidak reject
+    valid_coins = [d for d in data_list if d['Tier'] != "REJECT"]
     
-    valid_coins = [d for d in data_list if not d['Is_Cancel']]
     if not valid_coins:
-        return "😴 *SCREENER RESULTS*\nSemua koin filter out (Sideways/Counter-trend).\nTidak ada yang perlu dianalisa saat ini."
+        return "😴 *SCREENER RESULTS*\nSemua koin filter out (Sideways/Counter-trend).\nMarket sedang tidak bersahabat untuk intraday."
 
-    for i, d in enumerate(valid_coins[:5], 1): # Batasi 5 koin teratas
+    msg = "🔬 *SCREENER RESULTS (Buka chart & cocokkan dengan Pine v7.1)*\n"
+    msg += "Prioritaskan koin berlabel INST/VALID dengan Conviction tinggi.\n\n"
+    
+    for i, d in enumerate(valid_coins[:5], 1): # Batasi 5 koin
         direction = "🟢 LONG" if d['Composite'] > 0 else "🔴 SHORT"
         aln_badge = "✅3TF" if d['Aligned'] else "⚡2TF"
         rvol = d.get('True_RVOL', 0)
         rvol_badge = f" 📈{rvol:.1f}x" if rvol >= 1.5 else ""
         
+        # Tier Badge
+        tier = d['Tier']
+        tier_emoji = "💎" if tier == "INSTITUTIONAL" else "✅" if tier == "VALID" else "⚠️"
+        tier_text = f"{tier_emoji} *[{tier}]*" if tier in ["INSTITUTIONAL", "VALID"] else f"{tier_emoji} {tier}"
+        
         msg += (
-            f"{i}. *{d['Symbol']}* — {direction} `{d['Matrix_Sync']}`\n"
-            f"   SM: {d['SM_Signal']} | ADX: `{d['ADX']}` {aln_badge}{rvol_badge}\n"
-            f"   1H: {d.get('Trend_1h', 'N/A')} | Score: `{d['Composite']}`\n\n"
+            f"{i}. {d['Symbol']} — {direction} `{d['Matrix_Sync']}` {tier_text}\n"
+            f"   🧠 Conviction: `{d['Conviction']}/100` | Checklist: `{d['Checklist']}/7`\n"
+            f"   SM: {d['SM_Signal']} | ADX: `{d['ADX']}` {aln_badge}{rvol_badge}\n\n"
         )
     return msg
 
@@ -274,7 +361,7 @@ async def send_telegram(text):
             payload = {"chat_id": TG_CHAT_ID, "text": chunk, "parse_mode": "Markdown"}
             try:
                 async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    if resp.status == 400: # Fallback plain text
+                    if resp.status == 400: 
                         payload.pop("parse_mode", None)
                         await session.post(url, json=payload)
             except Exception as e:
@@ -295,16 +382,18 @@ async def main():
         await send_telegram("⚠️ Screener gagal mengambil data.")
         return
 
-    n_valid = sum(1 for d in data if not d['Is_Cancel'])
+    n_inst = sum(1 for d in data if d['Tier'] == "INSTITUTIONAL")
+    n_valid = sum(1 for d in data if d['Tier'] == "VALID")
+    
     header = (
         f"👁️ *GOD MODE SCREENER v7.1*\n"
-        f"🕐 {ts} | Rule-Based (No API Limits)\n"
-        f"📊 Scanned: {len(data)} koin | Valid: {n_valid}\n"
-        f"{'─' * 30}\n\n"
+        f"🕐 {ts} | Rule-Based (Zero API Limits)\n"
+        f"📊 Total Scanned: {len(data)} | 💎 INST: {n_inst} | ✅ VALID: {n_valid}\n"
+        f"{'─' * 35}\n\n"
     )
     
     await send_telegram(header + build_screener_message(data))
-    logging.info(f"✅ Screener selesai. {n_valid} koin valid dikirim.")
+    logging.info(f"✅ Screener selesai. {n_inst} INST, {n_valid} VALID dikirim.")
 
 if __name__ == "__main__":
     asyncio.run(main())
