@@ -2,9 +2,8 @@ name: Apex Quant v7.1 Screener
 
 on:
   schedule:
-    # Screener berjalan setiap 4 jam (00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC)
-    - cron: "0 */4 * * *"  
-  workflow_dispatch: # Tombol manual jika ingin scan dadakan
+    - cron: "0 */4 * * *"
+  workflow_dispatch:
 
 concurrency:
   group: apex-screener-flow
@@ -16,14 +15,16 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
       - name: Install Dependencies
         run: pip install ccxt aiohttp pandas numpy
+
       - name: Run Screener
-            - name: Run Screener
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
