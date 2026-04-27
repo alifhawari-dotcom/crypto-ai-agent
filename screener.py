@@ -9,38 +9,34 @@ from datetime import datetime
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-TG_TOKEN       = (os.getenv('TELEGRAM_TOKEN')    or '').strip()
-TG_CHAT_ID     = (os.getenv('TELEGRAM_CHAT_ID')  or '').strip()
-BYBIT_API_KEY  = (os.getenv('BYBIT_API_KEY')     or '').strip()
-BYBIT_SECRET   = (os.getenv('BYBIT_API_SECRET')  or '').strip()
+TG_TOKEN   = (os.getenv('TELEGRAM_TOKEN')   or '').strip()
+TG_CHAT_ID = (os.getenv('TELEGRAM_CHAT_ID') or '').strip()
 
-# ── CONSTANTS ────────────────────────────────────────────────
-TOP_COINS_BY_RVOL   = 50
-RANKED_CANDIDATES   = 12
-CANDLES_REQUIRED    = 100
-ADX_PERIOD          = 14
-ADX_MIN_NUCLEAR     = 18.0
-ADX_MIN_NORMAL      = 22.0
-CORR_WINDOW         = 30
-CORR_THRESHOLD      = 0.78
-EMA_FAST, EMA_SLOW  = 20, 50
-SWING_LOOKBACK      = 10
-SEMAPHORE_P1        = 5
-SEMAPHORE_P2        = 3
-PHASE2_DELAY        = 0.3
-MAX_RETRIES         = 3
-RETRY_DELAY         = 5
-WEEKEND_BLACKOUT    = True
+# ── CONSTANTS ─────────────────────────────────────────────────
+TOP_COINS_BY_RVOL = 50
+RANKED_CANDIDATES = 12
+CANDLES_REQUIRED  = 100
+ADX_PERIOD        = 14
+ADX_MIN_NUCLEAR   = 18.0
+ADX_MIN_NORMAL    = 22.0
+CORR_WINDOW       = 30
+CORR_THRESHOLD    = 0.78
+EMA_FAST, EMA_SLOW = 20, 50
+SWING_LOOKBACK    = 10
+SEMAPHORE_P1      = 5
+SEMAPHORE_P2      = 3
+PHASE2_DELAY      = 0.3
+MAX_RETRIES       = 3
+RETRY_DELAY       = 5
+WEEKEND_BLACKOUT  = True
+CONV_VALID        = 55
+CONV_HIGH         = 60
+CONV_INST         = 75
 
-# ── V7.1 TIER THRESHOLDS ─────────────────────────────────────
-CONV_VALID = 55
-CONV_HIGH  = 60
-CONV_INST  = 75
-
-# ── INDICATORS ───────────────────────────────────────────────
+# ── INDICATORS ────────────────────────────────────────────────
 def calc_atr(df, period=14):
     high, low, pc = df['high'], df['low'], df['close'].shift(1)
-    tr = pd.concat([high - low, (high - pc).abs(), (low - pc).abs()], axis=1).max(axis=1)
+    tr = pd.concat([high-low, (high-pc).abs(), (low-pc).abs()], axis=1).max(axis=1)
     median = tr.rolling(50, min_periods=1).median()
     clean = pd.Series(np.where(tr > median * 4, median, tr), index=df.index)
     return clean.rolling(period).mean()
@@ -62,11 +58,11 @@ def calc_macd(close):
 def calc_squeeze(df, atr):
     mean = df['close'].rolling(20).mean()
     sd   = df['close'].rolling(20).std()
-    return (mean + 2 * sd < mean + 1.5 * atr) & (mean - 2 * sd > mean - 1.5 * atr)
+    return (mean + 2*sd < mean + 1.5*atr) & (mean - 2*sd > mean - 1.5*atr)
 
 def calc_adx(df, period=14):
     high, low = df['high'], df['low']
-    up, down = high.diff(), -low.diff()
+    up, down  = high.diff(), -low.diff()
     pDM = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=df.index)
     mDM = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=df.index)
     atr_raw = calc_atr(df, period).replace(0, np.nan)
@@ -81,13 +77,13 @@ def _find_swings(highs, lows, lookback):
     sh, sl = [], []
     n = len(highs)
     for i in range(lookback, n - lookback):
-        lh = highs[i - lookback:i]
-        rh = highs[i + 1:i + lookback + 1]
-        ll = lows[i - lookback:i]
-        rl = lows[i + 1:i + lookback + 1]
-        if len(lh) == lookback and len(rh) == lookback and highs[i] >= max(lh) and highs[i] >= max(rh):
+        lh = highs[i-lookback:i]
+        rh = highs[i+1:i+lookback+1]
+        ll = lows[i-lookback:i]
+        rl = lows[i+1:i+lookback+1]
+        if len(lh)==lookback and len(rh)==lookback and highs[i]>=max(lh) and highs[i]>=max(rh):
             sh.append(float(highs[i]))
-        if len(ll) == lookback and len(rl) == lookback and lows[i] <= min(ll) and lows[i] <= min(rl):
+        if len(ll)==lookback and len(rl)==lookback and lows[i]<=min(ll) and lows[i]<=min(rl):
             sl.append(float(lows[i]))
     return sh, sl
 
@@ -105,10 +101,10 @@ def calc_swing_levels(df, lookback=10):
 def is_weekend_blackout():
     if not WEEKEND_BLACKOUT:
         return False
-    now = datetime.utcnow()
+    now      = datetime.utcnow()
     overflow = (now.hour + 7) >= 24
-    wd = (now.weekday() + (1 if overflow else 0)) % 7
-    hh = (now.hour + 7) % 24
+    wd       = (now.weekday() + (1 if overflow else 0)) % 7
+    hh       = (now.hour + 7) % 24
     if wd == 4 and hh >= 20: return True
     if wd in (5, 6):          return True
     if wd == 0 and hh < 9:   return True
@@ -120,7 +116,7 @@ def compute_rvol(ticker):
     last = float(ticker.get('last') or 1e-9)
     return (vol * max(chg, 0.1)) / last
 
-# ── SMC DETECTORS ────────────────────────────────────────────
+# ── SMC DETECTORS ─────────────────────────────────────────────
 def detect_fvg_simple(df, lookback=20):
     if len(df) < 5:
         return False, False
@@ -128,20 +124,18 @@ def detect_fvg_simple(df, lookback=20):
     if atr == 0:
         return False, False
     min_size = atr * 0.3
-    for i in range(2, min(lookback + 1, len(df))):
-        # Bullish FVG
-        gap_top = df['low'].iloc[i - 2]
+    for i in range(2, min(lookback+1, len(df))):
+        gap_top = df['low'].iloc[i-2]
         gap_bot = df['low'].iloc[i]
         if gap_top > gap_bot and (gap_top - gap_bot) >= min_size:
-            mid_close = df['close'].iloc[i - 1]
-            if not (mid_close <= gap_top and mid_close >= gap_bot):
+            mid = df['close'].iloc[i-1]
+            if not (mid <= gap_top and mid >= gap_bot):
                 return True, False
-        # Bearish FVG
         gap_top2 = df['high'].iloc[i]
-        gap_bot2 = df['high'].iloc[i - 2]
+        gap_bot2 = df['high'].iloc[i-2]
         if gap_top2 < gap_bot2 and (gap_bot2 - gap_top2) >= min_size:
-            mid_close = df['close'].iloc[i - 1]
-            if not (mid_close >= gap_top2 and mid_close <= gap_bot2):
+            mid = df['close'].iloc[i-1]
+            if not (mid >= gap_top2 and mid <= gap_bot2):
                 return False, True
     return False, False
 
@@ -154,14 +148,14 @@ def detect_ob_simple(df, lookback=10):
     vol_avg = df['volume'].rolling(20).mean().iloc[-1]
     if vol_avg == 0:
         return False, False
-    for i in range(1, min(lookback + 1, len(df) - 1)):
-        imp    = abs(df['close'].iloc[i - 1] - df['close'].iloc[i])
-        vol_ok = df['volume'].iloc[i - 1] > vol_avg * 1.5
+    for i in range(1, min(lookback+1, len(df)-1)):
+        imp    = abs(df['close'].iloc[i-1] - df['close'].iloc[i])
+        vol_ok = df['volume'].iloc[i-1] > vol_avg * 1.5
         if imp > atr * 2.0 and vol_ok:
-            if df['open'].iloc[i] > df['close'].iloc[i] and df['close'].iloc[i - 1] > df['open'].iloc[i - 1]:
+            if df['open'].iloc[i] > df['close'].iloc[i] and df['close'].iloc[i-1] > df['open'].iloc[i-1]:
                 if df['close'].iloc[-1] > df['open'].iloc[i]:
                     return True, False
-            if df['open'].iloc[i] < df['close'].iloc[i] and df['close'].iloc[i - 1] < df['open'].iloc[i - 1]:
+            if df['open'].iloc[i] < df['close'].iloc[i] and df['close'].iloc[i-1] < df['open'].iloc[i-1]:
                 if df['close'].iloc[-1] < df['open'].iloc[i]:
                     return False, True
     return False, False
@@ -173,9 +167,8 @@ async def fetch_ohlcv_safe(exchange, symbol, tf, limit):
             data = await asyncio.wait_for(
                 exchange.fetch_ohlcv(symbol, tf, limit=limit), timeout=15.0)
             if data and len(data) >= CANDLES_REQUIRED:
-                df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                return df
-        except Exception as e:
+                return pd.DataFrame(data, columns=['timestamp','open','high','low','close','volume'])
+        except Exception:
             if attempt < MAX_RETRIES - 1:
                 await asyncio.sleep(RETRY_DELAY)
     return None
@@ -184,15 +177,15 @@ def build_indicators(df):
     c, h, l, v = df['close'], df['high'], df['low'], df['volume']
     atr = calc_atr(df)
     rng = h - l
-    nd  = pd.Series(np.where(rng == 0, 0, ((c - l) - (h - c)) / rng * v), index=df.index)
+    nd  = pd.Series(np.where(rng==0, 0, ((c-l)-(h-c))/rng*v), index=df.index)
     ad  = nd.abs().rolling(20).mean()
-    sf  = np.clip((nd / np.where(ad == 0, 1, ad)) * 20, -40, 40)
+    sf  = np.clip((nd / np.where(ad==0, 1, ad)) * 20, -40, 40)
     rsi = calc_rsi(c)
-    ps  = sf + np.clip((rsi - 50) * 1.2, -30, 30)
+    ps  = sf + np.clip((rsi-50)*1.2, -30, 30)
     sw  = calc_swing_levels(df)
     vm  = v.rolling(20).mean().iloc[-1]
     vs  = v.rolling(20).std().iloc[-1]
-    z   = float((v.iloc[-1] - vm) / (vs if vs != 0 else 1))
+    z   = float((v.iloc[-1]-vm) / (vs if vs != 0 else 1))
     true_rvol = round(float(v.iloc[-1] / max(vm, 1e-9)), 2)
     return {
         'close':        float(c.iloc[-1]),
@@ -211,46 +204,48 @@ def build_indicators(df):
         '_df':          df
     }
 
-async def phase1_scan(exchange, coin):
-    df = await fetch_ohlcv_safe(exchange, coin['symbol'], '15m', CANDLES_REQUIRED)
+async def phase1_scan(bybit, coin):
+    # Konversi simbol Binance ke Bybit: BTC/USDT:USDT -> BTC/USDT
+    symbol = coin['symbol'].replace(':USDT', '')
+    df = await fetch_ohlcv_safe(bybit, symbol, '15m', CANDLES_REQUIRED)
     if df is None:
         return None
     i = build_indicators(df)
     return {
-        'symbol':        coin['symbol'],
-        'Symbol':        coin['symbol'].split(':')[0],
-        'Price':         i['close'],
-        'power_15m':     i['power_score'],
-        'RSI_15m':       i['rsi'],
-        'ATR_15m':       i['atr'],
-        'Squeeze_15m':   i['is_squeezing'],
+        'symbol':         coin['symbol'],
+        'Symbol':         coin['symbol'].split(':')[0],
+        'Price':          i['close'],
+        'power_15m':      i['power_score'],
+        'RSI_15m':        i['rsi'],
+        'ATR_15m':        i['atr'],
+        'Squeeze_15m':    i['is_squeezing'],
         'Swing_High_15m': i['swing_high'],
-        'Swing_Low_15m': i['swing_low'],
-        'ADX_15m':       i['adx'],
-        'rvol_score':    coin.get('_rvol', 0.0),
-        '_df_15m':       i['_df']
+        'Swing_Low_15m':  i['swing_low'],
+        'ADX_15m':        i['adx'],
+        'rvol_score':     coin.get('_rvol', 0.0),
+        '_df_15m':        i['_df']
     }
 
-async def phase2_enrich(exchange, c):
+async def phase2_enrich(bybit, c):
     await asyncio.sleep(PHASE2_DELAY)
+    symbol = c['symbol'].replace(':USDT', '')
     df_1h, df_5m = await asyncio.gather(
-        fetch_ohlcv_safe(exchange, c['symbol'], '1h', CANDLES_REQUIRED),
-        fetch_ohlcv_safe(exchange, c['symbol'], '5m', CANDLES_REQUIRED)
+        fetch_ohlcv_safe(bybit, symbol, '1h', CANDLES_REQUIRED),
+        fetch_ohlcv_safe(bybit, symbol, '5m', CANDLES_REQUIRED)
     )
-
     if df_1h is not None:
         i1    = build_indicators(df_1h)
         p     = i1['close']
-        trend = "UPTREND"   if p > i1['ema_f'] > i1['ema_s'] else \
-                "DOWNTREND" if p < i1['ema_f'] < i1['ema_s'] else "RANGING"
+        trend = ("UPTREND"   if p > i1['ema_f'] > i1['ema_s'] else
+                 "DOWNTREND" if p < i1['ema_f'] < i1['ema_s'] else "RANGING")
         c.update({
-            'Trend_1h':   trend,
-            'power_1h':   i1['power_score'],
-            'ADX_1h':     i1['adx'],
+            'Trend_1h':  trend,
+            'power_1h':  i1['power_score'],
+            'ADX_1h':    i1['adx'],
             'rvol_score': i1['true_rvol'],
-            'True_RVOL':  i1['true_rvol'],
-            '_close_1h':  df_1h['close'].values[-CORR_WINDOW:].tolist(),
-            '_df_1h':     i1['_df']
+            'True_RVOL': i1['true_rvol'],
+            '_close_1h': df_1h['close'].values[-CORR_WINDOW:].tolist(),
+            '_df_1h':    i1['_df']
         })
     else:
         c.update({
@@ -261,11 +256,10 @@ async def phase2_enrich(exchange, c):
             '_close_1h': [],
             '_df_1h':    None
         })
-
     if df_5m is not None:
-        i5   = build_indicators(df_5m)
-        z    = i5['z_score']
-        sqz  = i5['is_squeezing']
+        i5  = build_indicators(df_5m)
+        z   = i5['z_score']
+        sqz = i5['is_squeezing']
         sm_sig = ("💥NUC+SQZ" if z > 3.0 and sqz else
                   "🐳NUCLEAR" if z > 3.0 else
                   "🔥SQUEEZE" if sqz else
@@ -273,7 +267,6 @@ async def phase2_enrich(exchange, c):
         c.update({'z_score_5m': z, 'SM_Signal': sm_sig, 'power_5m': i5['power_score']})
     else:
         c.update({'z_score_5m': 0.0, 'SM_Signal': '😴QUIET', 'power_5m': c['power_15m']})
-
     return c
 
 def finalize_screener(c):
@@ -300,27 +293,26 @@ def finalize_screener(c):
     if aligned:
         comp += 5 if comp > 0 else -5
 
-    adx_val = max(c.get('ADX_1h', 0.0), c.get('ADX_15m', 0.0))
-    is_side = adx_val < (ADX_MIN_NUCLEAR if is_nuclear else ADX_MIN_NORMAL) and not is_nuclear
+    adx_val   = max(c.get('ADX_1h', 0.0), c.get('ADX_15m', 0.0))
+    is_side   = adx_val < (ADX_MIN_NUCLEAR if is_nuclear else ADX_MIN_NORMAL) and not is_nuclear
     is_cancel = ((trend == 'DOWNTREND' and comp > 0) or
                  (trend == 'UPTREND'   and comp < 0) or is_side)
 
-    c['Composite']   = round(comp, 1)
+    c['Composite']  = round(comp, 1)
     c['Matrix_Sync'] = ("FULL BULL" if comp >= 40 else
                         "BULLISH"   if comp > 10  else
                         "FULL BEAR" if comp <= -40 else
                         "BEARISH"   if comp < -10  else "NEUTRAL")
-    c['Aligned']     = aligned
-    c['ADX']         = adx_val
-    c['Sideways']    = is_side
-    c['Is_Cancel']   = is_cancel
+    c['Aligned']    = aligned
+    c['ADX']        = adx_val
+    c['Sideways']   = is_side
+    c['Is_Cancel']  = is_cancel
 
     # ── CONVICTION SCORE ──────────────────────────────────────
-    # FIX: Jangan pakai 'or' langsung pada DataFrame (ValueError pandas)
-    # Gunakan pengecekan eksplisit is not None
-    is_long  = comp > 0
-    _df_1h   = c.get('_df_1h')
-    _df_15m  = c.get('_df_15m')
+    # FIX: Tidak pakai 'or' langsung pada DataFrame (ValueError pandas)
+    is_long = comp > 0
+    _df_1h  = c.get('_df_1h')
+    _df_15m = c.get('_df_15m')
     if _df_1h is not None and not _df_1h.empty:
         df_smc = _df_1h
     elif _df_15m is not None and not _df_15m.empty:
@@ -338,13 +330,13 @@ def finalize_screener(c):
     has_ob  = (has_ob_bull  and is_long) or (has_ob_bear  and not is_long)
 
     conv = 0
-    if has_fvg:           conv += 20
-    if aligned:           conv += 12
-    if is_nuclear:        conv += 15
-    if adx_val > 25:      conv += 10
-    elif adx_val < 18:    conv -= 30
-    if c['Squeeze_15m']:  conv += 8
-    if has_ob:            conv += 8
+    if has_fvg:          conv += 20
+    if aligned:          conv += 12
+    if is_nuclear:       conv += 15
+    if adx_val > 25:     conv += 10
+    elif adx_val < 18:   conv -= 30
+    if c['Squeeze_15m']: conv += 8
+    if has_ob:           conv += 8
 
     conv = max(0, min(100, conv))
     c['Conviction'] = conv
@@ -390,23 +382,26 @@ def filter_by_correlation(candidates):
     return kept
 
 async def get_screener_data():
-    # FIX: Hapus 'session' kwarg — ccxt tidak support requests.Session
-    exchange = ccxt.bybit({
-        'apiKey':          BYBIT_API_KEY,
-        'secret':          BYBIT_SECRET,
-        'options':         {
-            'defaultType': 'swap',
-            'fetchCurrencies': False,
-        },
+    # ANTI-BLOKIR: Ticker dari Binance (public, bebas blokir)
+    #              OHLCV candle dari Bybit (endpoint public, tidak diblokir)
+    logging.info("Mengambil ticker dari Binance...")
+    binance = ccxt.binance({
         'enableRateLimit': True,
-        'timeout':         30000,
+        'options': {'defaultType': 'future'}
+    })
+    bybit = ccxt.bybit({
+        'enableRateLimit': True,
+        'options': {
+            'defaultType':     'swap',
+            'fetchCurrencies': False,
+        }
     })
 
     try:
-        tickers    = await exchange.fetch_tickers()
-        all_vols   = [float(v.get('quoteVolume', 0))
-                      for v in tickers.values()
-                      if float(v.get('quoteVolume', 0)) > 0]
+        tickers  = await binance.fetch_tickers()
+        all_vols = [float(v.get('quoteVolume', 0))
+                    for v in tickers.values()
+                    if float(v.get('quoteVolume', 0)) > 0]
         dynamic_min_vol = (max(5_000_000, np.percentile(all_vols, 70) * 0.5)
                            if all_vols else 7_000_000)
         liquid = [v for v in tickers.values()
@@ -415,19 +410,35 @@ async def get_screener_data():
         for v in liquid:
             v['_rvol'] = compute_rvol(v)
 
-        top   = sorted(liquid, key=lambda x: x['_rvol'], reverse=True)[:TOP_COINS_BY_RVOL]
-        p1    = await asyncio.gather(*[phase1_scan(exchange, c) for c in top])
+        # Hanya ambil pair USDT Perpetual
+        top = [v for v in sorted(liquid, key=lambda x: x['_rvol'], reverse=True)[:TOP_COINS_BY_RVOL]
+               if ':USDT' in v.get('symbol', '')]
+
+        logging.info(f"Universe: {len(tickers)} → Top {len(top)} liquid. Fetch OHLCV dari Bybit...")
+
+        # Phase 1
+        sem1 = asyncio.Semaphore(SEMAPHORE_P1)
+        async def sp1(coin):
+            async with sem1:
+                return await phase1_scan(bybit, coin)
+        p1    = await asyncio.gather(*[sp1(c) for c in top])
         cands = sorted([r for r in p1 if r],
                        key=lambda x: abs(x['power_15m']), reverse=True)[:RANKED_CANDIDATES]
 
-        enriched  = await asyncio.gather(*[phase2_enrich(exchange, c) for c in cands])
+        # Phase 2
+        sem2 = asyncio.Semaphore(SEMAPHORE_P2)
+        async def sp2(c):
+            async with sem2:
+                return await phase2_enrich(bybit, c)
+        enriched  = await asyncio.gather(*[sp2(c) for c in cands])
         finalized = sorted([finalize_screener(c) for c in enriched],
                            key=lambda x: x['Conviction'], reverse=True)
         return filter_by_correlation(finalized)
     finally:
-        await exchange.close()
+        await binance.close()
+        await bybit.close()
 
-# ── TELEGRAM BUILDER ─────────────────────────────────────────
+# ── TELEGRAM BUILDER ──────────────────────────────────────────
 def build_screener_message(data_list):
     valid_coins = [d for d in data_list if d['Tier'] != "REJECT"]
     if not valid_coins:
@@ -448,7 +459,6 @@ def build_screener_message(data_list):
         tier_text  = (f"{tier_emoji} *[{tier}]*"
                       if tier in ("INSTITUTIONAL", "VALID")
                       else f"{tier_emoji} {tier}")
-
         msg += (f"{i}. {d['Symbol']} — {direction} `{d['Matrix_Sync']}` {tier_text}\n"
                 f"   🧠 Conviction: `{d['Conviction']}/100` | Checklist: `{d['Checklist']}/7`\n"
                 f"   SM: {d['SM_Signal']} | ADX: `{d['ADX']}` {aln_badge}{rvol_badge}\n\n")
@@ -458,7 +468,7 @@ async def send_telegram(text):
     if not all([TG_TOKEN, TG_CHAT_ID]):
         return
     url    = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    chunks = [text[i:i + 4000] for i in range(0, len(text), 4000)]
+    chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
     async with aiohttp.ClientSession() as session:
         for chunk in chunks:
             payload = {"chat_id": TG_CHAT_ID, "text": chunk, "parse_mode": "Markdown"}
@@ -475,10 +485,6 @@ async def send_telegram(text):
 async def main():
     ts = datetime.now().strftime("%d %b %Y, %H:%M WIB")
 
-    if not all([BYBIT_API_KEY, BYBIT_SECRET]):
-        await send_telegram("❌ *ERROR*\nAPI Key Bybit belum di-set di GitHub Secrets.")
-        return
-
     if is_weekend_blackout():
         await send_telegram(f"😴 *SCREENER BLACKOUT*\n🕐 {ts}\n⛔ Weekend — Bot istirahat.")
         return
@@ -487,15 +493,15 @@ async def main():
     data = await get_screener_data()
 
     if not data:
-        await send_telegram("⚠️ Screener gagal mengambil data (Kemungkinan diblokir Bybit).")
+        await send_telegram("⚠️ Screener gagal mengambil data.")
         return
 
     n_inst  = sum(1 for d in data if d['Tier'] == "INSTITUTIONAL")
     n_valid = sum(1 for d in data if d['Tier'] == "VALID")
 
     header = (f"👁️ *GOD MODE SCREENER v7.1*\n"
-              f"🕐 {ts} | Rule-Based (Zero API Limits)\n"
-              f"📊 Total Scanned: {len(data)} | 💎 INST: {n_inst} | ✅ VALID: {n_valid}\n"
+              f"🕐 {ts} | Binance Ticker + Bybit OHLCV\n"
+              f"📊 Scanned: {len(data)} | 💎 INST: {n_inst} | ✅ VALID: {n_valid}\n"
               f"{'─' * 35}\n\n")
 
     await send_telegram(header + build_screener_message(data))
