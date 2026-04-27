@@ -6,7 +6,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
 TG_TOKEN   = (os.getenv('TELEGRAM_TOKEN')   or '').strip()
 TG_CHAT_ID = (os.getenv('TELEGRAM_CHAT_ID') or '').strip()
@@ -209,11 +209,12 @@ async def fetch_ohlcv_bybit(session, symbol, tf, limit):
     return None
 
 async def fetch_ohlcv_safe(session, symbol, tf, limit):
-    """Gate.io primary, Bybit fallback."""
-    df = await fetch_ohlcv_gate(session, symbol, tf, limit)
+    """Bybit kline primary (confirmed working from GitHub Actions IP),
+       Gate.io kline fallback."""
+    df = await fetch_ohlcv_bybit(session, symbol, tf, limit)
     if df is not None:
         return df
-    return await fetch_ohlcv_bybit(session, symbol, tf, limit)
+    return await fetch_ohlcv_gate(session, symbol, tf, limit)
 
 def build_indicators(df):
     c, h, l, v = df['close'], df['high'], df['low'], df['volume']
@@ -248,7 +249,10 @@ def build_indicators(df):
 
 async def phase1_scan(session, coin):
     df = await fetch_ohlcv_safe(session, coin['symbol'], '15m', CANDLES_REQUIRED)
-    if df is None: return None
+    if df is None:
+        logging.debug(f"  SKIP {coin['symbol']} — candle fetch gagal")
+        return None
+    logging.debug(f"  OK   {coin['symbol']} — {len(df)} candles")
     i = build_indicators(df)
     return {
         'symbol':         coin['symbol'],
