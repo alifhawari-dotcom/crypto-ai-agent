@@ -17,10 +17,14 @@ DETAIL = os.getenv('OI_DETAIL', '').strip().lower() == 'true'
 #   PX%  -> p50=0.296 p70=0.738 p80=1.132 p90=1.687 max=4.426
 # Temuan: OI bergerak JAUH lebih lambat dari harga (median 0.038% vs 0.296%).
 # Threshold lama OI=0.3 setara p90 -> cuma 10% pair lolos, terlalu ketat.
-# OI_MIN=0.08 (~p70, 30% pair lolos), PX_MIN=0.25 (~p45).
+# Kalibrasi #4 (14 Sep 2026, setelah OI dihitung ulang dgn lookback 1/4/16 bar):
+#   OI% n=92 -> p50=1.064 p70=1.423 p80=1.927 p90=4.331
+#   PX% n=92 -> p50=0.776 p70=1.096 p80=1.397 p90=1.939
+# OI_MIN lama (0.08) jauh di bawah p10 -> praktis tidak menyaring apa pun.
+# OI_MIN=1.2 (~p55), PX_MIN=0.5 (~p35).
 # CATATAN: ini sesi dini hari (sepi). Cek ulang DISTRIBUSI saat sesi ramai;
 # kalau kandidat jadi terlalu banyak, naikkan OI_MIN ke p80 (~0.12).
-OI_MIN, PX_MIN, RVOL_MIN = 0.08, 0.25, 1.0
+OI_MIN, PX_MIN, RVOL_MIN = 1.2, 0.5, 1.0
 FUND_EXT, FUND_VEXT = 0.0005, 0.0010
 LSR_HI, LSR_LO = 2.0, 0.5
 # TIMING: bedakan sinyal DINI (OI bergerak, harga belum) vs TERLAMBAT
@@ -328,6 +332,13 @@ def quad(px, oi):
     return 'LONG_UNWINDING'
 
 
+def fstate(fr):
+    if fr is None: return 'UNKNOWN', 'x'
+    if fr >= FUND_VEXT: return 'LONG_VCROWD', '[!!]'
+    if fr >= FUND_EXT: return 'LONG_CROWD', '[!]'
+    if fr <= -FUND_VEXT: return 'SHORT_VCROWD', '[!!]'
+    if fr <= -FUND_EXT: return 'SHORT_CROWD', '[!]'
+    return 'BALANCED', 'ok'
 
 
 def pick_tf(r_tf, dom):
@@ -625,12 +636,6 @@ async def main():
 if __name__ == "__main__":
     asyncio.run(main())
 
-def fstate(fr):
-    if fr is None: return 'UNKNOWN', 'x'
-    if fr >= FUND_VEXT: return 'LONG_VCROWD', '[!!]'
-    if fr >= FUND_EXT: return 'LONG_CROWD', '[!]'
-    if fr <= -FUND_VEXT: return 'SHORT_VCROWD', '[!!]'
-    if fr <= -FUND_EXT: return 'SHORT_CROWD', '[!]'
-    return 'BALANCED', 'ok'
+
 
 
