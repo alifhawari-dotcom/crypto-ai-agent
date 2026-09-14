@@ -256,6 +256,7 @@ def fstate(fr):
     return 'BALANCED', 'ok'
 
 
+
 def pick_tf(r_tf, dom):
     """TF representatif: yang kuadrannya cocok label & volumenya paling kuat.
     Dipakai BERSAMA oleh perhitungan timing dan tampilan Telegram, supaya
@@ -395,6 +396,7 @@ def fmt(r, i):
 DIV = "━" * 18
 
 def build(res, bfilter):
+    res = [r for r in res if r['sc'] >= MIN_SCORE]
     now = datetime.now(timezone.utc).astimezone()
     L  = [r for r in res if r['q'] == 'LONG_BUILDUP'   and not r['sq']]
     S  = [r for r in res if r['q'] == 'SHORT_BUILDUP'  and not r['sq']]
@@ -480,10 +482,6 @@ async def main():
                                    return_exceptions=True)
         res = [r for r in raw if r and not isinstance(r, Exception)]
         res.sort(key=lambda x: x['sc'], reverse=True)
-        before = len(res)
-res = [r for r in res if r['sc'] >= MIN_SCORE]
-        if before != len(res):
-            logging.info(f"Batas skor >={MIN_SCORE}: {len(res)} dari {before} lolos")
 
         # FILTER BYBIT (lapis akhir): buang kandidat yang tidak tradable di
         # Bybit. Pakai kline karena tickers/instruments-info kena geo-block.
@@ -531,4 +529,3 @@ res = [r for r in res if r['sc'] >= MIN_SCORE]
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
