@@ -24,7 +24,7 @@ DETAIL = os.getenv('OI_DETAIL', '').strip().lower() == 'true'
 # OI_MIN=1.2 (~p55), PX_MIN=0.5 (~p35).
 # CATATAN: ini sesi dini hari (sepi). Cek ulang DISTRIBUSI saat sesi ramai;
 # kalau kandidat jadi terlalu banyak, naikkan OI_MIN ke p80 (~0.12).
-OI_MIN, PX_MIN, RVOL_MIN = 1.2, 0.5, 1.0
+OI_MIN, PX_MIN, RVOL_MIN = 0.6, 0.4, 1.0
 FUND_EXT, FUND_VEXT = 0.0005, 0.0010
 LSR_HI, LSR_LO = 2.0, 0.5
 # TIMING: bedakan sinyal DINI (OI bergerak, harga belum) vs TERLAMBAT
@@ -52,7 +52,7 @@ MIN_TURNOVER, MIN_TF, MAX_SYM, TOPN = 1_000_000, 2, 400, 10
 # universe sudah tersaring ke koin yang listed di Bybit, sehingga koin
 # benar-benar tipis praktis sudah tidak masuk.
 # Angka volume TETAP ditampilkan sebagai fakta mentah tanpa tafsiran.
-MIN_SCORE = 60   # kandidat di bawah ini tidak dikirim (kurangi kebisingan)
+MIN_SCORE = 50   # kandidat di bawah ini tidak dikirim (kurangi kebisingan)
 
 # Token SAHAM / KOMODITAS / FOREX di Gate.io — BUKAN crypto.
 # Dibuang karena: (a) bukan instrumen yang kamu tradingkan, (b) saat bursa
@@ -70,7 +70,7 @@ NON_CRYPTO = {
     # komoditas / forex
     'XAU','XAG','XAUT','PAXG','OIL','GOLD','SILVER',
 }
-TFS = [('15m','15m'), ('1h','1h'), ('4h','4h')]
+TFS = [('1h','1h'), ('4h','4h')]
 SEM_N, RETRIES, DELAY, TMO = 12, 3, 3, 15
 GATE = "https://api.gateio.ws/api/v4/futures/usdt"
 BYBIT = "https://api.bybit.com/v5/market"
