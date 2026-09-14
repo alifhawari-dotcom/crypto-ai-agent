@@ -33,7 +33,19 @@ PX_EXTENDED      = 8.0     # harga sudah bergerak >= ini % -> dianggap telat
 # lebih sedikit coin dari Gate.io (1.700+), jadi yang lolos sudah melewati
 # standar listing Bybit. MAX_SYM dinaikkan, semaphore dinaikkan agar runtime
 # tetap wajar (tiap simbol = 6 panggilan API).
-MIN_TURNOVER, MIN_TF, MAX_SYM, TOPN = 500_000, 2, 400, 10
+# Turnover minimum $1jt (kompromi: $500rb terlalu longgar, $2jt membuang
+# terlalu banyak). Dasar: penelitian ScienceDirect (3.600+ koin, 2015-2021)
+# menunjukkan koin tidak likuid didominasi efek REVERSAL harian, bukan
+# momentum. Koin tipis TIDAK dibuang seluruhnya, tapi masuk tier C yang
+# perlakuannya berbeda + diberi peringatan eksplisit.
+MIN_TURNOVER, MIN_TF, MAX_SYM, TOPN = 1_000_000, 2, 400, 10
+
+# TIER LIKUIDITAS (turnover 24h, USD).
+# Temuan empiris: momentum adalah fenomena koin BESAR; koin kecil justru
+# menunjukkan pembalikan (reversal). Jadi sinyal yang sama punya arti
+# BERBEDA tergantung tier - tidak boleh diperlakukan sama.
+TIER_A_MIN = 50_000_000   # likuid: momentum berlaku, tren = konfirmasi
+TIER_B_MIN = 10_000_000   # menengah: netral
 MIN_SCORE = 60   # kandidat di bawah ini tidak dikirim (kurangi kebisingan)
 
 # Token SAHAM / KOMODITAS / FOREX di Gate.io — BUKAN crypto.
@@ -149,7 +161,8 @@ async def universe(s, bsyms):
             continue
         if tv < MIN_TURNOVER or lp <= 0:
             continue
-        out.append({'c': c, 'sym': bs, 'tv': tv, 'fr': fr})
+        tier = 'A' if tv >= TIER_A_MIN else ('B' if tv >= TIER_B_MIN else 'C')
+        out.append({'c': c, 'sym': bs, 'tv': tv, 'fr': fr, 'tier': tier})
     out.sort(key=lambda x: x['tv'], reverse=True)
     out = out[:MAX_SYM]
     logging.info(f"Universe: {len(out)} pair (tak ada di Bybit: {skip}, "
@@ -182,7 +195,7 @@ async def stats_oi_series(s, c):
                    {"contract": c, "interval": "15m", "limit": 20},
                    "Gate contract_stats")
     if not d or not isinstance(d, list) or len(d) < 17:
-        return {}, None, None
+        return {}, None, None, None
     try:
         d = sorted(d, key=lambda x: x.get('time', 0))
     except Exception:
@@ -190,7 +203,7 @@ async def stats_oi_series(s, c):
 
     oi = [_f(x, 'open_interest_usd', 'open_interest') for x in d]
     if any(v is None for v in oi[-17:]):
-        return {}, None, None
+        return {}, None, None, None
 
     if DIAG:
         logging.info(f"[DIAG-OI] {c} seri15m OI 3 terakhir={oi[-3:]} "
@@ -201,8 +214,40 @@ async def stats_oi_series(s, c):
         return ((oi[-1] - base) / base * 100.0) if base and base > 0 else None
 
     out = {'15m': chg(1), '1h': chg(4), '4h': chg(16)}
+
+    # Z-SCORE OI: seberapa TIDAK BIASA lonjakan ini untuk koin INI sendiri.
+    # Persentase OI sudah ternormalisasi terhadap ukuran koin (adil), tapi
+    # variansnya berbeda: koin yang OI-nya rutin bergerak +-8% tiap 15m,
+    # lalu +10%, itu normal. Koin yang biasanya +-0.5% lalu +10% = anomali.
+    # Z-score menangkap perbedaan itu TANPA menghukum koin kecil karena
+    # ukurannya - mengukur sinyal relatif terhadap kebisingan koin sendiri.
+    steps = []
+    for i in range(1, len(oi)):
+        if oi[i-1] and oi[i-1] > 0:
+            steps.append((oi[i] - oi[i-1]) / oi[i-1] * 100.0)
+    z = None
+    if len(steps) >= 8:
+        arr = np.array(steps[:-1])          # kebiasaan historis
+        sd = float(arr.std())
+        if sd > 1e-9:
+            z = float((steps[-1] - arr.mean()) / sd)
+
+    # PERSISTENSI: berapa banyak bar terakhir yang bergerak SEARAH.
+    # Membedakan dua pola yang artinya berbeda:
+    #   - Akumulasi bertahap: OI naik konsisten di banyak bar, tiap kenaikan
+    #     kecil. Posisi dibangun perlahan - biasanya uang yang niat tahan.
+    #   - Lonjakan mendadak: satu bar melonjak, sebelumnya datar. Bisa berita,
+    #     bisa satu pemain besar masuk-keluar cepat (hit and run).
+    # Z-score saja hanya menangkap pola KEDUA. Tanpa persistensi, akumulasi
+    # bertahap justru tidak terdeteksi padahal sering lebih dapat diandalkan.
+    persist = None
+    if len(steps) >= 8:
+        recent = steps[-8:]
+        up = sum(1 for v in recent if v > 0)
+        persist = up / len(recent)          # 1.0 = naik terus, 0.0 = turun terus
+
     last = d[-1]
-    return out, _f(last, 'lsr_account'), _f(last, 'top_lsr_account')
+    return out, _f(last, 'lsr_account'), z, persist
 
 
 async def kline(s, c, iv):
@@ -302,14 +347,14 @@ def pick_tf(r_tf, dom):
 
 async def screen(s, it, sem, st):
     async with sem:
-        oimap, lsr_v, tlsr_v = await stats_oi_series(s, it['c'])
+        oimap, lsr_v, oi_z, oi_persist = await stats_oi_series(s, it['c'])
         trend, tr_emoji = await trend_4h(s, it['c'])
         tf = {}
         for lb, iv in TFS:
             px, rv = await kline(s, it['c'], iv)
             oi = oimap.get(lb)
             tf[lb] = {'oi': oi, 'px': px, 'rv': rv, 'lsr': lsr_v,
-                      'tlsr': tlsr_v, 'q': quad(px, oi)}
+                      'q': quad(px, oi)}
     # Rekam nilai riil 1h untuk laporan distribusi (dasar kalibrasi threshold)
     t1 = tf.get('1h', {})
     if t1.get('oi') is not None:
@@ -326,8 +371,7 @@ async def screen(s, it, sem, st):
     con = qs.count(dom)
     if con < MIN_TF:
         st['inconsist'] += 1; return None
-    if dom not in ('LONG_BUILDUP', 'SHORT_BUILDUP',
-                   'LONG_UNWINDING', 'SHORT_COVERING'):
+    if dom not in ('LONG_BUILDUP', 'SHORT_BUILDUP', 'LONG_UNWINDING'):
         st['not_buildup'] += 1; return None
     rv1 = tf.get('1h', {}).get('rv') or 0.0
     if rv1 < RVOL_MIN:
@@ -337,7 +381,6 @@ async def screen(s, it, sem, st):
     fr = it['fr']
     fs, fe = fstate(fr)
     lsr = tf.get('1h', {}).get('lsr')
-    tlsr = tf.get('1h', {}).get('tlsr')
     lhi = lsr is not None and lsr >= LSR_HI
     llo = lsr is not None and lsr <= LSR_LO
     sq = ((dom == 'LONG_BUILDUP' and (fs in ('LONG_CROWD', 'LONG_VCROWD') or lhi)) or
@@ -370,13 +413,48 @@ async def screen(s, it, sem, st):
     counter = ((dom in ('LONG_BUILDUP', 'SHORT_COVERING') and trend == 'DOWN') or
                (dom in ('SHORT_BUILDUP', 'LONG_UNWINDING') and trend == 'UP'))
 
+    tier = it.get('tier', 'C')
     sc = con * 15 + min(int(rv1 * 10), 25)
-    # TREN diberi bobot BESAR: kelanjutan tren punya dasar literatur yang
-    # jauh lebih kuat daripada hipotesis "OI mendahului harga".
-    if counter:
-        sc -= 25
-    elif trend in ('UP', 'DOWN'):
+
+    # --- POLA OI: akumulasi bertahap vs lonjakan mendadak ---
+    # Keduanya diberi bobot SEIMBANG. Akumulasi sedikit lebih tinggi karena
+    # pola bertahap lebih sulit dipalsukan satu pihak, tapi lonjakan tetap
+    # dihargai karena bisa menandai masuknya informasi baru.
+    oi_pat, oi_pat_emoji = None, ''
+    long_side = dom in ('LONG_BUILDUP', 'SHORT_COVERING')
+    aligned_persist = (oi_persist is not None and
+                       ((long_side and oi_persist >= 0.75) or
+                        (not long_side and oi_persist <= 0.25)))
+    spike = oi_z is not None and abs(oi_z) >= 2.5
+
+    if aligned_persist and not spike:
+        oi_pat, oi_pat_emoji = 'AKUMULASI', '🧱'
+        sc += 12
+    elif spike and not aligned_persist:
+        oi_pat, oi_pat_emoji = 'LONJAKAN', '⚡'
+        sc += 8
+    elif aligned_persist and spike:
+        oi_pat, oi_pat_emoji = 'AKUM+LONJAK', '🧱⚡'
         sc += 15
+
+    # === LOGIKA PER TIER LIKUIDITAS (berbasis temuan empiris) ===
+    # Tier A (likuid): momentum berlaku. Searah tren = konfirmasi kuat.
+    # Tier C (tipis):  reversal dominan. Searah tren TIDAK bisa diandalkan,
+    #                  dan harga yang sudah bergerak jauh justru rawan balik.
+    # Jarak antar tier SENGAJA kecil (15/12/9). Alasan: bukti empiris soal
+    # momentum-vs-reversal berasal dari horizon HARIAN, sementara kita pakai
+    # 15m-4h. Menerapkan beda bobot besar = overclaim atas bukti yang ada.
+    # Tier menggeser peringkat, tidak mendominasi.
+    if tier == 'A':
+        if counter:                     sc -= 22
+        elif trend in ('UP', 'DOWN'):   sc += 15
+    elif tier == 'B':
+        if counter:                     sc -= 18
+        elif trend in ('UP', 'DOWN'):   sc += 12
+    else:  # tier C
+        if counter:                     sc -= 14
+        elif trend in ('UP', 'DOWN'):   sc += 9
+        if timing == 'EXTENDED':        sc -= 10
     # TIMING = LABEL SAJA, TIDAK mempengaruhi skor.
     #
     # Versi sebelumnya memberi bonus +12 untuk DINI dan penalti -15 untuk
@@ -401,52 +479,40 @@ async def screen(s, it, sem, st):
         sc += 10
     return {'sym': it['sym'], 'q': dom, 'con': con, 'ntf': len(TFS), 'fr': fr,
             'fr_extreme': fr_ext, 'fr_note': fr_note,
-            'timing': timing, 't_emoji': t_emoji, 'lead': round(lead, 1),
-            'tf_used': tf_lb, 'trend': trend, 'tr_emoji': tr_emoji,
-            'counter': counter,
-            'fs': fs, 'fe': fe, 'lsr': lsr, 'tlsr': tlsr, 'sq': sq,
+            'timing': timing,
+            'trend': trend, 'tr_emoji': tr_emoji,
+            'counter': counter, 'tier': tier, 'tv': it.get('tv', 0),
+            'oi_z': oi_z, 'oi_persist': oi_persist,
+            'oi_pat': oi_pat, 'oi_pat_emoji': oi_pat_emoji,
+            'fs': fs, 'fe': fe, 'lsr': lsr, 'sq': sq,
             'rv': round(rv1, 2), 'sc': max(0, min(100, sc)), 'tf': tf}
 
 
 def fmt(r, i):
-    """Default RINGKAS (2 baris). Set OI_DETAIL=true untuk rincian per-TF.
-    TF yang ditampilkan = TF yang mendukung label, dengan RVOL tertinggi."""
-    # TF yang sama persis dengan yang dipakai menghitung timing
+    """2 baris per koin. Baris ketiga HANYA kalau ada yang perlu diwaspadai."""
     lb, t = pick_tf(r['tf'], r['q'])
-
     px = f"{t['px']:+.1f}%" if t.get('px') is not None else "n/a"
-    oi = f"{t['oi']:+.2f}%" if t.get('oi') is not None else "n/a"
+    oi = f"{t['oi']:+.1f}%" if t.get('oi') is not None else "n/a"
     rv = f"{t['rv']:.1f}x" if t.get('rv') is not None else "n/a"
-    fr = f"{r['fr']*100:+.3f}%" if r['fr'] is not None else "n/a"
-    ls = f" · L/S {r['lsr']:.2f}" if r['lsr'] is not None else ""
+    fr = f"{r['fr']*100:+.2f}%" if r['fr'] is not None else "n/a"
+    tv = r.get('tv', 0)
+    tv_s = f"{tv/1e6:.0f}jt" if tv >= 1e6 else f"{tv/1e3:.0f}rb"
 
-    tmg = r.get('t_emoji', '')
-    trd = r.get('tr_emoji', '')
-    out = [f"<b>{i}. {r['sym']}</b>  ·  {r['sc']}/100  ·  TF {r['con']}/{r['ntf']}  {tmg}{trd}",
-           f"    {lb}  Px {px} · OI {oi} · Vol {rv}",
-           f"    Fund {fr}{ls}"]
+    flags = r.get('tr_emoji', '') + r.get('oi_pat_emoji', '')
+    out = [f"<b>{i}. {r['sym']}</b> {r['sc']} {flags}",
+           f"   {lb} {px} · OI {oi} · Vol {rv} · Fund {fr} · ${tv_s}"]
 
+    warn = []
     if r.get('counter'):
-        tr = 'turun' if r.get('trend') == 'DOWN' else 'naik'
-        out.append(f"   ⛔ MELAWAN TREN 4h ({tr}) — risiko lebih tinggi")
-    if r.get('timing') == 'EARLY':
-        out.append(f"   🌱 DINI — OI {r['lead']}x lebih cepat dari harga")
-    elif r.get('timing') == 'EXTENDED':
-        out.append(f"   🕐 TERLAMBAT — harga sudah bergerak jauh")
-    if r.get('fr_extreme'):
-        out.append(f"   🚨 {r['fr_note']}")
+        warn.append("lawan tren")
     if r.get('sq'):
-        sd = "long" if r['q'] == 'LONG_BUILDUP' else "short"
-        out.append(f"   ⚠️ sisi {sd} sudah terlalu ramai")
-
-    if DETAIL:
-        for l2, _ in TFS:
-            t2 = r['tf'].get(l2, {})
-            m = "✓" if t2.get('q') == r['q'] else " "
-            p2 = f"{t2['px']:+.2f}%" if t2.get('px') is not None else "n/a"
-            o2 = f"{t2['oi']:+.2f}%" if t2.get('oi') is not None else "n/a"
-            v2 = f"{t2['rv']:.1f}x" if t2.get('rv') is not None else "n/a"
-            out.append(f"      {m}{l2}: Px {p2} OI {o2} Vol {v2}")
+        warn.append("sisi ramai, rawan cascade")
+    if r.get('fr_extreme'):
+        warn.append("funding ekstrem")
+    if r.get('tier') == 'C':
+        warn.append("koin tipis")
+    if warn:
+        out.append("   ⚠️ " + " · ".join(warn))
     return "\n".join(out)
 
 
@@ -457,40 +523,24 @@ def build(res, bfilter):
     now = datetime.now(timezone.utc).astimezone()
     L  = [r for r in res if r['q'] == 'LONG_BUILDUP'   and not r['sq']]
     S  = [r for r in res if r['q'] == 'SHORT_BUILDUP'  and not r['sq']]
-    LU = [r for r in res if r['q'] == 'LONG_UNWINDING' and not r['sq']]
-    SC = [r for r in res if r['q'] == 'SHORT_COVERING' and not r['sq']]
+    U  = [r for r in res if r['q'] == 'LONG_UNWINDING' and not r['sq']]
     Q  = [r for r in res if r['sq']]
 
-    p = [f"📡 <b>OI SCREENER</b>",
-         f"{now.strftime('%d %b %Y · %H:%M')} WIB",
-         f"{len(res)} kandidat" + ("" if bfilter else "  ⚠️ blm difilter Bybit")]
+    p = [f"📡 <b>OI SCREENER</b> · {now.strftime('%d %b %H:%M')}"]
+    if not bfilter:
+        p.append("⚠️ blm difilter Bybit")
 
-    secs = [
-        (L,  "🟢 LONG BUILDUP",   "Px↑ OI↑ — uang baru masuk long", 8),
-        (S,  "🔴 SHORT BUILDUP",  "Px↓ OI↑ — uang baru masuk short", 8),
-        (LU, "🟠 LONG UNWINDING", "Px↓ OI↓ — long keluar. Short menarik bila "
-                                  "habis pump; waspada bila sudah turun panjang", 6),
-        (SC, "🔵 SHORT COVERING", "Px↑ OI↓ — short tutup. Bullish tapi cepat habis", 6),
-        (Q,  "⚡ SQUEEZE WATCH",  "Buildup tapi sisinya kelewat ramai — rawan "
-                                  "cascade. Amati, jangan masuk", 6),
-    ]
-    for items, title, desc, cap in secs:
+    for items, title in ((L, "🟢 LONG"), (S, "🔴 SHORT"),
+                         (U, "🟠 UNWIND"), (Q, "⚡ SQUEEZE")):
         if not items:
             continue
-        p.append("")
-        p.append(DIV)
-        p.append(f"<b>{title}</b>")
-        p.append(f"<i>{desc}</i>")
-        p.append(DIV)
-        for i, r in enumerate(items[:cap], 1):
-            p.append("")
-            p.append(fmt(r, i))
+        p.append(f"\n<b>{title}</b>")
+        p += [fmt(r, i) for i, r in enumerate(items[:8], 1)]
 
     if not res:
-        p.append("\nTidak ada kandidat siklus ini.")
-    p.append("")
-    p.append(DIV)
-    p.append("<i>Deskriptif, bukan rekomendasi. Cek chart sebelum masuk.</i>")
+        p.append("\nTidak ada kandidat.")
+    else:
+        p.append("\n<i>📈tren ↔️range 📉turun · 🧱akumulasi ⚡lonjakan</i>")
     return "\n".join(p)
 
 
@@ -586,4 +636,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
