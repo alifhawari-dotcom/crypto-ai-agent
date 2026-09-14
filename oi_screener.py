@@ -114,24 +114,41 @@ def _f(d, *ks):
     return None
 
 
-async def stats_oi(s, c, iv):
+async def stats_oi_series(s, c):
+    """Ambil SATU seri 15m, lalu turunkan perubahan OI dengan lookback berbeda:
+    1 bar=15m, 4 bar=1h, 16 bar=4h.
+
+    Kenapa begini: agregasi contract_stats per-interval milik Gate menghasilkan
+    perubahan OI yang IDENTIK antara 1h dan 4h (terbukti 14 Sep 2026 - bucket
+    terakhir 1h dan 4h sama-sama jatuh di batas yang sama). Menghitung sendiri
+    dari satu seri konsisten menghilangkan ketergantungan pada agregasi itu,
+    sekaligus memangkas 3 panggilan API jadi 1.
+    """
     d = await _get(s, f"{GATE}/contract_stats",
-                   {"contract": c, "interval": iv, "limit": 3}, "Gate contract_stats")
-    if not d or not isinstance(d, list) or len(d) < 2:
-        return None, None, None
-    if DIAG:
-        _ts = [x.get('time') for x in d]
-        logging.info(f"[DIAG-OI] {c} iv={iv} timestamps={_ts} "
-                     f"selisih={(_ts[-1]-_ts[-2]) if len(_ts)>1 and all(_ts) else 'n/a'}s")
+                   {"contract": c, "interval": "15m", "limit": 20},
+                   "Gate contract_stats")
+    if not d or not isinstance(d, list) or len(d) < 17:
+        return {}, None, None
     try:
         d = sorted(d, key=lambda x: x.get('time', 0))
     except Exception:
         pass
-    new, old = d[-1], d[-2]
-    a = _f(new, 'open_interest_usd', 'open_interest')
-    b = _f(old, 'open_interest_usd', 'open_interest')
-    oi = ((a - b) / b * 100.0) if (a is not None and b and b > 0) else None
-    return oi, _f(new, 'lsr_account'), _f(new, 'top_lsr_account')
+
+    oi = [_f(x, 'open_interest_usd', 'open_interest') for x in d]
+    if any(v is None for v in oi[-17:]):
+        return {}, None, None
+
+    if DIAG:
+        logging.info(f"[DIAG-OI] {c} seri15m OI 3 terakhir={oi[-3:]} "
+                     f"lookback1={oi[-2]} lookback4={oi[-5]} lookback16={oi[-17]}")
+
+    def chg(lb):
+        base = oi[-1 - lb]
+        return ((oi[-1] - base) / base * 100.0) if base and base > 0 else None
+
+    out = {'15m': chg(1), '1h': chg(4), '4h': chg(16)}
+    last = d[-1]
+    return out, _f(last, 'lsr_account'), _f(last, 'top_lsr_account')
 
 
 async def kline(s, c, iv):
@@ -187,12 +204,13 @@ def fstate(fr):
 
 async def screen(s, it, sem, st):
     async with sem:
+        oimap, lsr_v, tlsr_v = await stats_oi_series(s, it['c'])
         tf = {}
         for lb, iv in TFS:
-            oi, lsr, tlsr = await stats_oi(s, it['c'], iv)
             px, rv = await kline(s, it['c'], iv)
-            tf[lb] = {'oi': oi, 'px': px, 'rv': rv, 'lsr': lsr,
-                      'tlsr': tlsr, 'q': quad(px, oi)}
+            oi = oimap.get(lb)
+            tf[lb] = {'oi': oi, 'px': px, 'rv': rv, 'lsr': lsr_v,
+                      'tlsr': tlsr_v, 'q': quad(px, oi)}
     # Rekam nilai riil 1h untuk laporan distribusi (dasar kalibrasi threshold)
     t1 = tf.get('1h', {})
     if t1.get('oi') is not None:
