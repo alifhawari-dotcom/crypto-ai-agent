@@ -34,6 +34,20 @@ PX_EXTENDED      = 8.0     # harga sudah bergerak >= ini % -> dianggap telat
 # standar listing Bybit. MAX_SYM dinaikkan, semaphore dinaikkan agar runtime
 # tetap wajar (tiap simbol = 6 panggilan API).
 MIN_TURNOVER, MIN_TF, MAX_SYM, TOPN = 500_000, 2, 400, 10
+MIN_SCORE = 60   # kandidat di bawah ini tidak dikirim (kurangi kebisingan)
+
+# Token SAHAM / KOMODITAS / FOREX di Gate.io — BUKAN crypto.
+# Dibuang karena: (a) bukan instrumen yang kamu tradingkan, (b) saat bursa
+# asalnya tutup, OI bisa bergerak sementara harga diam -> sinyal palsu.
+NON_CRYPTO = {
+    # saham AS / semikonduktor
+    'NVDA','META','MU','SOXL','SOXS','AVGO','ORCL','IBM','AAOI','INTC','AMD',
+    'TSLA','AAPL','MSFT','GOOGL','AMZN','NFLX','COIN','MSTR','CRWV','ASML',
+    'SNDK','WDC','SKHYNIX','SKHY','SAMSUNG','CXMT','DRAM','4STOCK','LITE',
+    'CRCL','OPENAI','ANTHROPIC','SPX','QQQ','ESPORTS','MVLL','MET','RAVE',
+    # komoditas / forex
+    'XAU','XAG','XAUT','PAXG','OIL','GOLD','SILVER',
+}
 TFS = [('15m','15m'), ('1h','1h'), ('4h','4h')]
 SEM_N, RETRIES, DELAY, TMO = 12, 3, 3, 15
 GATE = "https://api.gateio.ws/api/v4/futures/usdt"
@@ -116,11 +130,14 @@ async def universe(s, bsyms):
     d = await _get(s, f"{GATE}/tickers", lbl="Gate tickers")
     if not d:
         return []
-    out, skip = [], 0
+    out, skip, skip_noncrypto = [], 0, 0
     for i in d:
         c = i.get('contract', '')
         if not c.endswith('_USDT'):
             continue
+        base = c.replace('_USDT', '')
+        if base in NON_CRYPTO:
+            skip_noncrypto += 1; continue
         bs = c.replace('_', '')
         if bsyms is not None and bs not in bsyms:
             skip += 1; continue
@@ -135,7 +152,8 @@ async def universe(s, bsyms):
         out.append({'c': c, 'sym': bs, 'tv': tv, 'fr': fr})
     out.sort(key=lambda x: x['tv'], reverse=True)
     out = out[:MAX_SYM]
-    logging.info(f"Universe: {len(out)} pair (dibuang, tak ada di Bybit: {skip})")
+    logging.info(f"Universe: {len(out)} pair (tak ada di Bybit: {skip}, "
+                 f"non-crypto: {skip_noncrypto})")
     return out
 
 
@@ -462,6 +480,10 @@ async def main():
                                    return_exceptions=True)
         res = [r for r in raw if r and not isinstance(r, Exception)]
         res.sort(key=lambda x: x['sc'], reverse=True)
+        before = len(res)
+res = [r for r in res if r['sc'] >= MIN_SCORE]
+        if before != len(res):
+            logging.info(f"Batas skor >={MIN_SCORE}: {len(res)} dari {before} lolos")
 
         # FILTER BYBIT (lapis akhir): buang kandidat yang tidak tradable di
         # Bybit. Pakai kline karena tickers/instruments-info kena geo-block.
@@ -481,7 +503,7 @@ async def main():
                          f"terkonfirmasi ada di Bybit")
             if ok_n > 0:
                 logging.info(f"Filter Bybit (via kline): {len(keep)} lolos, "
-f"{dropped} dibuang (tidak ada di Bybit)")
+                             f"{dropped} dibuang (tidak ada di Bybit)")
                 res = keep
                 bybit_ok = True
             else:
@@ -509,5 +531,4 @@ f"{dropped} dibuang (tidak ada di Bybit)")
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-                
+    
