@@ -53,15 +53,44 @@ async def _get(s, url, p=None, lbl=""):
     return None
 
 
+BYBIT_SYMBOLS_FILE = "bybit_symbols.json"
+
+
+def load_bybit_symbols_local():
+    """Baca daftar simbol Bybit dari file lokal (diambil manual dari IP
+    non-US via fetch_bybit_symbols.py, karena endpoint live Bybit diblokir
+    dari GitHub Actions). Lebih andal daripada memanggil API tiap run."""
+    try:
+        with open(BYBIT_SYMBOLS_FILE) as f:
+            data = json.load(f)
+        syms = set(data.get('symbols', []))
+        if syms:
+            logging.info(f"Bybit: {len(syms)} simbol dari file lokal "
+                         f"(update: {data.get('updated_at', '?')})")
+            return syms
+    except FileNotFoundError:
+        logging.warning(f"{BYBIT_SYMBOLS_FILE} tidak ditemukan.")
+    except (json.JSONDecodeError, KeyError) as e:
+        logging.warning(f"{BYBIT_SYMBOLS_FILE} rusak/tidak valid: {e}")
+    return None
+
+
 async def bybit_syms(s):
+    # PRIORITAS 1: file lokal (endpoint live Bybit diblokir dari Actions)
+    local = load_bybit_symbols_local()
+    if local:
+        return local
+
+    # FALLBACK: coba endpoint live (kadang-kadang bisa berubah status)
     d = await _get(s, f"{BYBIT}/instruments-info",
                    {"category": "linear", "limit": 1000}, "Bybit instruments-info")
     if not d or d.get('retCode') != 0:
-        logging.warning("Simbol Bybit tak terambil - filter Bybit NONAKTIF.")
+        logging.warning("Simbol Bybit tak terambil (file lokal & API) - "
+                        "filter Bybit NONAKTIF.")
         return None
     sy = {i['symbol'] for i in d.get('result', {}).get('list', [])
           if i.get('symbol', '').endswith('USDT') and i.get('status') == 'Trading'}
-    logging.info(f"Bybit: {len(sy)} simbol tradable")
+    logging.info(f"Bybit: {len(sy)} simbol tradable (live API)")
     return sy
 
 
@@ -288,8 +317,9 @@ def fmt(r, i):
     fr = f"{r['fr']*100:+.3f}%" if r['fr'] is not None else "n/a"
     ls = f" · L/S {r['lsr']:.2f}" if r['lsr'] is not None else ""
 
-    out = [f"<b>{i}. {r['sym']}</b>  {r['sc']}/100  ·  TF {r['con']}/{r['ntf']}",
-           f"   {lb} Px {px} · OI {oi} · Vol {rv} · Fund {fr}{ls}"]
+    out = [f"<b>{i}. {r['sym']}</b>  ·  {r['sc']}/100  ·  TF {r['con']}/{r['ntf']}",
+           f"    {lb}  Px {px} · OI {oi} · Vol {rv}",
+           f"    Fund {fr}{ls}"]
 
     if r.get('fr_extreme'):
         out.append(f"   🚨 {r['fr_note']}")
@@ -308,6 +338,8 @@ def fmt(r, i):
     return "\n".join(out)
 
 
+DIV = "━" * 18
+
 def build(res, bfilter):
     now = datetime.now(timezone.utc).astimezone()
     L  = [r for r in res if r['q'] == 'LONG_BUILDUP'   and not r['sq']]
@@ -316,27 +348,36 @@ def build(res, bfilter):
     SC = [r for r in res if r['q'] == 'SHORT_COVERING' and not r['sq']]
     Q  = [r for r in res if r['sq']]
 
-    p = [f"📡 <b>OI SCREENER</b> · {now.strftime('%d %b %H:%M')} WIB",
-         f"{len(res)} kandidat" + ("" if bfilter else " · ⚠️ blm difilter Bybit")]
+    p = [f"📡 <b>OI SCREENER</b>",
+         f"{now.strftime('%d %b %Y · %H:%M')} WIB",
+         f"{len(res)} kandidat" + ("" if bfilter else "  ⚠️ blm difilter Bybit")]
 
     secs = [
-        (L,  "🟢 LONG BUILDUP",    "Px↑ OI↑ · uang baru masuk long", 8),
-        (S,  "🔴 SHORT BUILDUP",   "Px↓ OI↑ · uang baru masuk short", 8),
-        (LU, "🟠 LONG UNWINDING",  "Px↓ OI↓ · long keluar · short menarik BILA "
-                                   "habis pump; waspada bila sudah turun panjang", 6),
-        (SC, "🔵 SHORT COVERING",  "Px↑ OI↓ · short tutup · bullish tapi cepat habis", 6),
-        (Q,  "⚡ SQUEEZE WATCH",   "buildup tapi sisinya kelewat ramai · "
-                                   "rawan cascade · amati, jangan masuk", 6),
+        (L,  "🟢 LONG BUILDUP",   "Px↑ OI↑ — uang baru masuk long", 8),
+        (S,  "🔴 SHORT BUILDUP",  "Px↓ OI↑ — uang baru masuk short", 8),
+        (LU, "🟠 LONG UNWINDING", "Px↓ OI↓ — long keluar. Short menarik bila "
+                                  "habis pump; waspada bila sudah turun panjang", 6),
+        (SC, "🔵 SHORT COVERING", "Px↑ OI↓ — short tutup. Bullish tapi cepat habis", 6),
+        (Q,  "⚡ SQUEEZE WATCH",  "Buildup tapi sisinya kelewat ramai — rawan "
+                                  "cascade. Amati, jangan masuk", 6),
     ]
     for items, title, desc, cap in secs:
         if not items:
             continue
-        p.append(f"\n<b>{title}</b> <i>({desc})</i>")
-        p += [fmt(r, i) for i, r in enumerate(items[:cap], 1)]
+        p.append("")
+        p.append(DIV)
+        p.append(f"<b>{title}</b>")
+        p.append(f"<i>{desc}</i>")
+        p.append(DIV)
+        for i, r in enumerate(items[:cap], 1):
+            p.append("")
+            p.append(fmt(r, i))
 
     if not res:
         p.append("\nTidak ada kandidat siklus ini.")
-    p.append("\n<i>Deskriptif, bukan rekomendasi. Cek chart sebelum masuk.</i>")
+    p.append("")
+    p.append(DIV)
+    p.append("<i>Deskriptif, bukan rekomendasi. Cek chart sebelum masuk.</i>")
     return "\n".join(p)
 
 
@@ -399,7 +440,10 @@ async def main():
                     keep.append(r)
                 else:
                     dropped += 1
-            if any(c is True for c in checks if not isinstance(c, Exception)):
+            ok_n = sum(1 for c in checks if c is True)
+            logging.info(f"Cek Bybit via kline: {ok_n}/{len(checks)} kandidat "
+                         f"terkonfirmasi ada di Bybit")
+            if ok_n > 0:
                 logging.info(f"Filter Bybit (via kline): {len(keep)} lolos, "
                              f"{dropped} dibuang (tidak ada di Bybit)")
                 res = keep
