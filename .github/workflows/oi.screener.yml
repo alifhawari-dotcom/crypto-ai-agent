@@ -48,4 +48,5 @@ jobs:
         env:
           OI_TELEGRAM_TOKEN: ${{ secrets.OI_TELEGRAM_TOKEN }}
           OI_TELEGRAM_CHAT_ID: ${{ secrets.OI_TELEGRAM_CHAT_ID }}
+          OI_DIAGNOSTIC: ${{ secrets.OI_DIAGNOSTIC }}
         run: python oi_screener.py
