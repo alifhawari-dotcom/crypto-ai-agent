@@ -58,9 +58,15 @@ TG_CHAT_ID = (os.getenv('OI_TELEGRAM_CHAT_ID') or '').strip()
 DIAGNOSTIC_MODE = os.getenv('OI_DIAGNOSTIC', '').strip().lower() == 'true'
 
 # ── THRESHOLD (BELUM DIKALIBRASI — ubah setelah lihat hasil nyata) ──────
-OI_CHANGE_MIN_PCT    = 2.0     # % perubahan OI minimum agar dianggap bergerak
-PRICE_CHANGE_MIN_PCT = 0.5     # % perubahan harga minimum agar dianggap bergerak
-RVOL_MIN             = 1.3     # volume relatif minimum (validasi sinyal)
+# DIKALIBRASI 14 Sep 2026 dari data riil: perubahan OI per-candle untuk coin
+# likuid umumnya 0.5-2%, bukan >2%. Threshold lama (2.0) membuang hampir semua
+# kandidat. Angka di bawah masih PERKIRAAN — longgarkan/ketatkan setelah
+# melihat berapa kandidat yang lolos per siklus.
+OI_CHANGE_MIN_PCT    = 0.8     # % perubahan OI minimum agar dianggap bergerak
+PRICE_CHANGE_MIN_PCT = 0.3     # % perubahan harga minimum agar dianggap bergerak
+RVOL_MIN             = 1.1     # volume relatif minimum (validasi sinyal)
+TOP_LSR_EXTREME_HI   = 1.5     # rasio akun trader TOP: > ini = top trader long
+TOP_LSR_EXTREME_LO   = 0.67    # < ini = top trader short
 FUNDING_EXTREME      = 0.0005  # 0.05%/8h — batas "crowded"
 FUNDING_VERY_EXTREME = 0.0010  # 0.10%/8h — batas "sangat crowded"
 LSR_EXTREME_HI       = 2.0     # long/short account ratio > ini = long ramai
@@ -183,13 +189,19 @@ async def fetch_contract_stats(session, contract, interval, limit=3):
                       {"contract": contract, "interval": interval, "limit": limit},
                       label="Gate contract_stats")
     if not data or not isinstance(data, list) or len(data) < 2:
-        return None, None
+        return None, None, None
 
     if DIAGNOSTIC_MODE:
         logging.info(f"[DIAG] contract_stats {contract}: "
                      f"{json.dumps(data[0], indent=2)[:600]}")
 
-    # Gate mengembalikan urutan lama→baru
+    # JANGAN asumsikan urutan — sort eksplisit berdasarkan field 'time'.
+    # (Bug versi sebelumnya: mengasumsikan lama→baru, padahal Gate bisa
+    #  mengembalikan baru→lama, yang membalik TANDA perubahan OI.)
+    try:
+        data = sorted(data, key=lambda d: d.get('time', 0))
+    except Exception:
+        pass
     latest, prev = data[-1], data[-2]
 
     def _f(d, *keys):
@@ -210,8 +222,9 @@ async def fetch_contract_stats(session, contract, interval, limit=3):
     if oi_now is not None and oi_prev and oi_prev > 0:
         oi_chg = ((oi_now - oi_prev) / oi_prev) * 100.0
 
-    lsr = _f(latest, 'lsr_account', 'long_short_ratio', 'lsr_taker')
-    return oi_chg, lsr
+    lsr     = _f(latest, 'lsr_account', 'long_short_ratio')
+    top_lsr = _f(latest, 'top_lsr_account')
+    return oi_chg, lsr, top_lsr
 
 
 # ── LAPIS 4: kline dari Gate (harga + volume) ──────────────────────────
@@ -270,42 +283,54 @@ def lsr_state(lsr):
 
 
 # ── SCREENING PER SIMBOL ────────────────────────────────────────────────
-async def screen_symbol(session, item, sem):
+async def screen_symbol(session, item, sem, stats):
+    """stats = dict penghitung alasan gugur, supaya kita tahu PERSIS di tahap
+    mana kandidat tersaring — bukan menebak kenapa hasilnya 0."""
     contract = item['contract']
     async with sem:
         tf_data = {}
         for label, interval, _ in TIMEFRAMES:
-            oi_chg, lsr   = await fetch_contract_stats(session, contract, interval)
-            price_chg, rv = await fetch_gate_kline(session, contract, interval)
+            oi_chg, lsr, top_lsr = await fetch_contract_stats(session, contract, interval)
+            price_chg, rv        = await fetch_gate_kline(session, contract, interval)
             tf_data[label] = {
                 'oi_chg':    oi_chg,
                 'price_chg': price_chg,
                 'rvol':      rv,
                 'lsr':       lsr,
+                'top_lsr':   top_lsr,
                 'quadrant':  classify_quadrant(price_chg, oi_chg),
             }
+
+    if all(v['oi_chg'] is None for v in tf_data.values()):
+        stats['no_oi_data'] += 1
+        return None
 
     quads = [v['quadrant'] for v in tf_data.values()
              if v['quadrant'] and v['quadrant'] != 'NEUTRAL']
     if not quads:
+        stats['all_neutral'] += 1
         return None
     dominant    = max(set(quads), key=quads.count)
     consistency = quads.count(dominant)
 
     if consistency < MIN_TF_CONSISTENCY:
+        stats['low_consistency'] += 1
         return None
     if dominant not in ('LONG_BUILDUP', 'SHORT_BUILDUP'):
-        return None  # hanya dua kuadran buildup, sesuai keputusan
-
-    # Validasi volume: OI bergerak tanpa volume = sinyal lemah
-    rvol_1h = tf_data.get('1h', {}).get('rvol') or 0.0
-    if rvol_1h < RVOL_MIN:
+        stats['not_buildup'] += 1
         return None
 
+    rvol_1h = tf_data.get('1h', {}).get('rvol') or 0.0
+    if rvol_1h < RVOL_MIN:
+        stats['low_rvol'] += 1
+        return None
+
+    stats['passed'] += 1
     funding = item.get('funding')
     fstate, femoji = funding_state(funding)
-    lsr = tf_data.get('1h', {}).get('lsr')
-    lstate = lsr_state(lsr)
+    lsr     = tf_data.get('1h', {}).get('lsr')
+    top_lsr = tf_data.get('1h', {}).get('top_lsr')
+    lstate  = lsr_state(lsr)
 
     # SQUEEZE WATCH: buildup yang sisi ramainya SEARAH posisi itu sendiri.
     # Long buildup + long crowded  → rally bergantung leverage, rawan cascade.
@@ -337,6 +362,7 @@ async def screen_symbol(session, item, sem):
         'funding_state': fstate,
         'funding_emoji': femoji,
         'lsr':          lsr,
+        'top_lsr':      top_lsr,
         'lsr_state':    lstate,
         'squeeze':      squeeze,
         'rvol_1h':      round(rvol_1h, 2),
@@ -371,11 +397,12 @@ def _fmt(r, i):
     pc_s = f"{pc:+.2f}%" if pc is not None else "n/a"
     fr_s = f"{r['funding']*100:+.4f}%" if r['funding'] is not None else "n/a"
     lsr_s = f" | L/S {r['lsr']:.2f}" if r['lsr'] is not None else ""
+    top_s = f" | topL/S {r['top_lsr']:.2f}" if r.get('top_lsr') is not None else ""
     return (
         f"{i}. <b>{r['symbol']}</b> · Skor {r['score']}/100\n"
         f"   1h: OI {oi_s} | Harga {pc_s} | RVOL {r['rvol_1h']}x\n"
         f"   TF konsisten {r['consistency']}/{r['tf_total']} | "
-        f"Funding {fr_s} {r['funding_emoji']}{lsr_s}"
+        f"Funding {fr_s} {r['funding_emoji']}{lsr_s}{top_s}"
     )
 
 
@@ -461,36 +488,4 @@ async def send_telegram(session, text):
 # ── MAIN ────────────────────────────────────────────────────────────────
 async def main():
     async with aiohttp.ClientSession(headers={'Accept': 'application/json'}) as session:
-        bybit_symbols = await fetch_bybit_symbols(session)
-        universe = await fetch_gate_universe(session, bybit_symbols)
-
-        if not universe:
-            msg = ("📡 <b>OI QUADRANT SCREENER</b>\n\n"
-                   "❌ Universe kosong — Gate.io tickers tidak bisa diambil. "
-                   "Cek log GitHub Actions untuk detail error.")
-            logging.error("Universe kosong dari Gate.io.")
-            await send_telegram(session, msg)
-            return
-
-        sem = asyncio.Semaphore(SEMAPHORE_LIMIT)
-        raw = await asyncio.gather(
-            *[screen_symbol(session, it, sem) for it in universe],
-            return_exceptions=True
-        )
-
-        results = []
-        for r in raw:
-            if isinstance(r, Exception):
-                logging.debug(f"task error: {r}")
-            elif r:
-                results.append(r)
-
-        results.sort(key=lambda x: x['score'], reverse=True)
-        logging.info(f"Kandidat lolos: {len(results)} dari {len(universe)} pair dipindai")
-
-        await send_telegram(session,
-                            build_message(results, bybit_symbols is not None))
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+ 
