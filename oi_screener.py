@@ -9,6 +9,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s-%(levelname)s-%(mess
 TG_TOKEN = (os.getenv('OI_TELEGRAM_TOKEN') or '').strip()
 TG_CHAT = (os.getenv('OI_TELEGRAM_CHAT_ID') or '').strip()
 DIAG = os.getenv('OI_DIAGNOSTIC', '').strip().lower() == 'true'
+# Default RINGKAS. Set secret OI_DETAIL=true kalau mau rincian per-timeframe.
+DETAIL = os.getenv('OI_DETAIL', '').strip().lower() == 'true'
 
 # Kalibrasi #3 (14 Sep 2026, berbasis DISTRIBUSI nyata n=77, sesi 03:55 WIB):
 #   OI%  -> p50=0.038 p70=0.086 p80=0.123 p90=0.286 max=8.622
@@ -227,7 +229,8 @@ async def screen(s, it, sem, st):
     con = qs.count(dom)
     if con < MIN_TF:
         st['inconsist'] += 1; return None
-    if dom not in ('LONG_BUILDUP', 'SHORT_BUILDUP'):
+    if dom not in ('LONG_BUILDUP', 'SHORT_BUILDUP',
+                   'LONG_UNWINDING', 'SHORT_COVERING'):
         st['not_buildup'] += 1; return None
     rv1 = tf.get('1h', {}).get('rv') or 0.0
     if rv1 < RVOL_MIN:
@@ -253,6 +256,10 @@ async def screen(s, it, sem, st):
         fr_note = f"{side} bayar sangat mahal - potensi squeeze {('turun' if fr > 0 else 'naik')}"
 
     sc = con * 15 + min(int(rv1 * 10), 25)
+    # Exit-flow (posisi keluar) secara literatur lebih lemah/ambigu dibanding
+    # buildup (uang baru masuk) -> penalti agar urutan skor mencerminkan itu.
+    if dom in ('LONG_UNWINDING', 'SHORT_COVERING'):
+        sc -= 8
     ois = [abs(v['oi']) for v in tf.values() if v['oi'] is not None]
     if ois:
         sc += min(int(np.mean(ois) * 2), 20)
@@ -265,60 +272,71 @@ async def screen(s, it, sem, st):
 
 
 def fmt(r, i):
-    """Tampilkan SEMUA timeframe, dengan penanda TF mana yang mendukung label.
-    (Bug versi lama: selalu menampilkan angka 1h, padahal label ditentukan dari
-     mayoritas lintas TF -> angka bisa kontradiktif dengan labelnya.)"""
-    lines = [f"{i}. <b>{r['sym']}</b> · Skor {r['sc']}/100"]
-    for lb, _ in TFS:
-        t = r['tf'].get(lb, {})
-        oi = f"{t['oi']:+.2f}%" if t.get('oi') is not None else "n/a"
-        px = f"{t['px']:+.2f}%" if t.get('px') is not None else "n/a"
-        rv = f"{t['rv']:.1f}x" if t.get('rv') is not None else "n/a"
-        mark = "✓" if t.get('q') == r['q'] else " "
-        lines.append(f"   {mark}{lb}: OI {oi} | Px {px} | RV {rv}")
-    fr = f"{r['fr']*100:+.4f}%" if r['fr'] is not None else "n/a"
-    ls = f" | L/S {r['lsr']:.2f}" if r['lsr'] is not None else ""
-    tl = f" | topL/S {r['tlsr']:.2f}" if r['tlsr'] is not None else ""
-    lines.append(f"   TF cocok {r['con']}/{r['ntf']} | Funding {fr} {r['fe']}{ls}{tl}")
+    """Default RINGKAS (2 baris). Set OI_DETAIL=true untuk rincian per-TF.
+    TF yang ditampilkan = TF yang mendukung label, dengan RVOL tertinggi."""
+    # pilih TF representatif: yang kuadrannya cocok label & RVOL paling kuat
+    cands = [(lb, t) for lb, t in r['tf'].items()
+             if t.get('q') == r['q'] and t.get('px') is not None]
+    if cands:
+        lb, t = max(cands, key=lambda x: (x[1].get('rv') or 0))
+    else:
+        lb, t = '1h', r['tf'].get('1h', {})
+
+    px = f"{t['px']:+.1f}%" if t.get('px') is not None else "n/a"
+    oi = f"{t['oi']:+.2f}%" if t.get('oi') is not None else "n/a"
+    rv = f"{t['rv']:.1f}x" if t.get('rv') is not None else "n/a"
+    fr = f"{r['fr']*100:+.3f}%" if r['fr'] is not None else "n/a"
+    ls = f" · L/S {r['lsr']:.2f}" if r['lsr'] is not None else ""
+
+    out = [f"<b>{i}. {r['sym']}</b>  {r['sc']}/100  ·  TF {r['con']}/{r['ntf']}",
+           f"   {lb} Px {px} · OI {oi} · Vol {rv} · Fund {fr}{ls}"]
+
     if r.get('fr_extreme'):
-        lines.append(f"   🚨 FUNDING EKSTREM ({r['fr_note']})")
-    return "\n".join(lines)
+        out.append(f"   🚨 {r['fr_note']}")
+    if r.get('sq'):
+        sd = "long" if r['q'] == 'LONG_BUILDUP' else "short"
+        out.append(f"   ⚠️ sisi {sd} sudah terlalu ramai")
+
+    if DETAIL:
+        for l2, _ in TFS:
+            t2 = r['tf'].get(l2, {})
+            m = "✓" if t2.get('q') == r['q'] else " "
+            p2 = f"{t2['px']:+.2f}%" if t2.get('px') is not None else "n/a"
+            o2 = f"{t2['oi']:+.2f}%" if t2.get('oi') is not None else "n/a"
+            v2 = f"{t2['rv']:.1f}x" if t2.get('rv') is not None else "n/a"
+            out.append(f"      {m}{l2}: Px {p2} OI {o2} Vol {v2}")
+    return "\n".join(out)
 
 
 def build(res, bfilter):
     now = datetime.now(timezone.utc).astimezone()
-    L = [r for r in res if r['q'] == 'LONG_BUILDUP' and not r['sq']]
-    S = [r for r in res if r['q'] == 'SHORT_BUILDUP' and not r['sq']]
-    Q = [r for r in res if r['sq']]
-    note = ("hanya coin tradable di Bybit" if bfilter
-            else "filter Bybit TIDAK aktif - cek ketersediaan manual")
-    p = ["📡 <b>OI QUADRANT SCREENER</b>",
-         f"🕐 {now.strftime('%d %b %Y, %H:%M')} WIB",
-         f"📊 Gate.io | {note}",
-         f"🎯 {len(res)} kandidat (long {len(L)} · short {len(S)} · squeeze {len(Q)})",
-         "─" * 26]
+    L  = [r for r in res if r['q'] == 'LONG_BUILDUP'   and not r['sq']]
+    S  = [r for r in res if r['q'] == 'SHORT_BUILDUP'  and not r['sq']]
+    LU = [r for r in res if r['q'] == 'LONG_UNWINDING' and not r['sq']]
+    SC = [r for r in res if r['q'] == 'SHORT_COVERING' and not r['sq']]
+    Q  = [r for r in res if r['sq']]
+
+    p = [f"📡 <b>OI SCREENER</b> · {now.strftime('%d %b %H:%M')} WIB",
+         f"{len(res)} kandidat" + ("" if bfilter else " · ⚠️ blm difilter Bybit")]
+
+    secs = [
+        (L,  "🟢 LONG BUILDUP",    "Px↑ OI↑ · uang baru masuk long", 8),
+        (S,  "🔴 SHORT BUILDUP",   "Px↓ OI↑ · uang baru masuk short", 8),
+        (LU, "🟠 LONG UNWINDING",  "Px↓ OI↓ · long keluar · short menarik BILA "
+                                   "habis pump; waspada bila sudah turun panjang", 6),
+        (SC, "🔵 SHORT COVERING",  "Px↑ OI↓ · short tutup · bullish tapi cepat habis", 6),
+        (Q,  "⚡ SQUEEZE WATCH",   "buildup tapi sisinya kelewat ramai · "
+                                   "rawan cascade · amati, jangan masuk", 6),
+    ]
+    for items, title, desc, cap in secs:
+        if not items:
+            continue
+        p.append(f"\n<b>{title}</b> <i>({desc})</i>")
+        p += [fmt(r, i) for i, r in enumerate(items[:cap], 1)]
+
     if not res:
-        p.append("\nTidak ada kandidat lolos siklus ini.")
-        return "\n".join(p)
-    if L:
-        p.append("\n<b>🟢 LONG BUILDUP</b>")
-        p.append("<i>Setup LONG - harga naik, OI naik: uang baru masuk long</i>\n")
-        p += [fmt(r, i) for i, r in enumerate(L[:TOPN], 1)]
-    if S:
-        p.append("\n<b>🔴 SHORT BUILDUP</b>")
-        p.append("<i>Setup SHORT - harga turun, OI naik: uang baru masuk short</i>\n")
-        p += [fmt(r, i) for i, r in enumerate(S[:TOPN], 1)]
-    if Q:
-        p.append("\n<b>⚡ SQUEEZE WATCH</b>")
-        p.append("<i>Buildup TAPI sisi itu sudah terlalu ramai (funding/LSR ekstrem). "
-                 "Rapuh: gerakan kecil melawan bisa memicu cascade. "
-                 "Kandidat PENGAMATAN, bukan sinyal masuk.</i>\n")
-        for i, r in enumerate(Q[:TOPN], 1):
-            sd = "long" if r['q'] == 'LONG_BUILDUP' else "short"
-            p.append(fmt(r, i) + f"\n   ⚠️ sisi {sd} crowded")
-    p.append("\n" + "─" * 26)
-    p.append("<i>Deskriptif, bukan rekomendasi. Threshold belum dikalibrasi. "
-             "Cek chart sendiri.</i>")
+        p.append("\nTidak ada kandidat siklus ini.")
+    p.append("\n<i>Deskriptif, bukan rekomendasi. Cek chart sebelum masuk.</i>")
     return "\n".join(p)
 
 
