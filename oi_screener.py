@@ -10,10 +10,15 @@ TG_TOKEN = (os.getenv('OI_TELEGRAM_TOKEN') or '').strip()
 TG_CHAT = (os.getenv('OI_TELEGRAM_CHAT_ID') or '').strip()
 DIAG = os.getenv('OI_DIAGNOSTIC', '').strip().lower() == 'true'
 
-# Kalibrasi #2 (14 Sep 2026): run 03:49 WIB -> 74/77 pair gugur NEUTRAL
-# dengan OI_MIN=0.8/PX_MIN=0.3. Diturunkan lagi. Sesi dini hari memang sepi,
-# jadi angka ini mungkin masih perlu disesuaikan setelah lihat sesi ramai.
-OI_MIN, PX_MIN, RVOL_MIN = 0.3, 0.15, 1.0
+# Kalibrasi #3 (14 Sep 2026, berbasis DISTRIBUSI nyata n=77, sesi 03:55 WIB):
+#   OI%  -> p50=0.038 p70=0.086 p80=0.123 p90=0.286 max=8.622
+#   PX%  -> p50=0.296 p70=0.738 p80=1.132 p90=1.687 max=4.426
+# Temuan: OI bergerak JAUH lebih lambat dari harga (median 0.038% vs 0.296%).
+# Threshold lama OI=0.3 setara p90 -> cuma 10% pair lolos, terlalu ketat.
+# OI_MIN=0.08 (~p70, 30% pair lolos), PX_MIN=0.25 (~p45).
+# CATATAN: ini sesi dini hari (sepi). Cek ulang DISTRIBUSI saat sesi ramai;
+# kalau kandidat jadi terlalu banyak, naikkan OI_MIN ke p80 (~0.12).
+OI_MIN, PX_MIN, RVOL_MIN = 0.08, 0.25, 1.0
 FUND_EXT, FUND_VEXT = 0.0005, 0.0010
 LSR_HI, LSR_LO = 2.0, 0.5
 MIN_TURNOVER, MIN_TF, MAX_SYM, TOPN = 3_000_000, 2, 300, 8
