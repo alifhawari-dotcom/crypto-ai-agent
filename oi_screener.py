@@ -70,7 +70,7 @@ NON_CRYPTO = {
     # komoditas / forex
     'XAU','XAG','XAUT','PAXG','OIL','GOLD','SILVER',
 }
-TFS = [('1h','1h'),('1h','1h'),('4h','4h')]
+TFS = [('15m','15m'),('1h','1h'),('4h','4h')]
 SEM_N, RETRIES, DELAY, TMO = 12, 3, 3, 15
 GATE = "https://api.gateio.ws/api/v4/futures/usdt"
 BYBIT = "https://api.bybit.com/v5/market"
