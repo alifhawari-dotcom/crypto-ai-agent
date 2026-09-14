@@ -36,16 +36,18 @@ PX_EXTENDED      = 8.0     # harga sudah bergerak >= ini % -> dianggap telat
 # Turnover minimum $1jt (kompromi: $500rb terlalu longgar, $2jt membuang
 # terlalu banyak). Dasar: penelitian ScienceDirect (3.600+ koin, 2015-2021)
 # menunjukkan koin tidak likuid didominasi efek REVERSAL harian, bukan
-# momentum. Koin tipis TIDAK dibuang seluruhnya, tapi masuk tier C yang
-# perlakuannya berbeda + diberi peringatan eksplisit.
+# momentum. Koin sangat tipis dibuang lewat ambang ini; sisanya diperlakukan
+# sama (lihat catatan penghapusan tier di bawah).
 MIN_TURNOVER, MIN_TF, MAX_SYM, TOPN = 1_000_000, 2, 400, 10
 
-# TIER LIKUIDITAS (turnover 24h, USD).
-# Temuan empiris: momentum adalah fenomena koin BESAR; koin kecil justru
-# menunjukkan pembalikan (reversal). Jadi sinyal yang sama punya arti
-# BERBEDA tergantung tier - tidak boleh diperlakukan sama.
-TIER_A_MIN = 50_000_000   # likuid: momentum berlaku, tren = konfirmasi
-TIER_B_MIN = 10_000_000   # menengah: netral
+# CATATAN: klasifikasi tier likuiditas DIHAPUS 14 Sep 2026.
+# Alasan: proxy-nya (turnover Gate.io) tidak mengukur likuiditas pasar yang
+# sebenarnya - XLM tercatat hanya $5jt di Gate padahal likuid secara global.
+# Penelitian momentum-vs-reversal memakai likuiditas pasar riil, jadi
+# menerapkannya lewat volume satu bursa adalah salah kaprah. Selain itu
+# universe sudah tersaring ke koin yang listed di Bybit, sehingga koin
+# benar-benar tipis praktis sudah tidak masuk.
+# Angka volume TETAP ditampilkan sebagai fakta mentah tanpa tafsiran.
 MIN_SCORE = 60   # kandidat di bawah ini tidak dikirim (kurangi kebisingan)
 
 # Token SAHAM / KOMODITAS / FOREX di Gate.io — BUKAN crypto.
@@ -57,6 +59,10 @@ NON_CRYPTO = {
     'TSLA','AAPL','MSFT','GOOGL','AMZN','NFLX','COIN','MSTR','CRWV','ASML',
     'SNDK','WDC','SKHYNIX','SKHY','SAMSUNG','CXMT','DRAM','4STOCK','LITE',
     'CRCL','OPENAI','ANTHROPIC','SPX','QQQ','ESPORTS','MVLL','MET','RAVE',
+    'QCOM','GLW','SPCX','SNXX','BSP','AKE','TSM','ARM','PLTR','SMCI','DELL',
+    'HPQ','STX','KLAC','LRCX','AMAT','NXPI','ADI','TXN','ON','MCHP','SWKS',
+    'QRVO','MRVL','ALAB','CRDO','ANET','CIEN','JNPR','ERIC','NOK','ZM','SNOW',
+    'DDOG','NET','CRWD','PANW','ZS','OKTA','MDB','TEAM','NOW','WDAY','ADBE',
     # komoditas / forex
     'XAU','XAG','XAUT','PAXG','OIL','GOLD','SILVER',
 }
@@ -161,8 +167,7 @@ async def universe(s, bsyms):
             continue
         if tv < MIN_TURNOVER or lp <= 0:
             continue
-        tier = 'A' if tv >= TIER_A_MIN else ('B' if tv >= TIER_B_MIN else 'C')
-        out.append({'c': c, 'sym': bs, 'tv': tv, 'fr': fr, 'tier': tier})
+        out.append({'c': c, 'sym': bs, 'tv': tv, 'fr': fr})
     out.sort(key=lambda x: x['tv'], reverse=True)
     out = out[:MAX_SYM]
     logging.info(f"Universe: {len(out)} pair (tak ada di Bybit: {skip}, "
@@ -413,48 +418,13 @@ async def screen(s, it, sem, st):
     counter = ((dom in ('LONG_BUILDUP', 'SHORT_COVERING') and trend == 'DOWN') or
                (dom in ('SHORT_BUILDUP', 'LONG_UNWINDING') and trend == 'UP'))
 
-    tier = it.get('tier', 'C')
     sc = con * 15 + min(int(rv1 * 10), 25)
 
-    # --- POLA OI: akumulasi bertahap vs lonjakan mendadak ---
-    # Keduanya diberi bobot SEIMBANG. Akumulasi sedikit lebih tinggi karena
-    # pola bertahap lebih sulit dipalsukan satu pihak, tapi lonjakan tetap
-    # dihargai karena bisa menandai masuknya informasi baru.
-    oi_pat, oi_pat_emoji = None, ''
-    long_side = dom in ('LONG_BUILDUP', 'SHORT_COVERING')
-    aligned_persist = (oi_persist is not None and
-                       ((long_side and oi_persist >= 0.75) or
-                        (not long_side and oi_persist <= 0.25)))
-    spike = oi_z is not None and abs(oi_z) >= 2.5
-
-    if aligned_persist and not spike:
-        oi_pat, oi_pat_emoji = 'AKUMULASI', '🧱'
-        sc += 12
-    elif spike and not aligned_persist:
-        oi_pat, oi_pat_emoji = 'LONJAKAN', '⚡'
-        sc += 8
-    elif aligned_persist and spike:
-        oi_pat, oi_pat_emoji = 'AKUM+LONJAK', '🧱⚡'
-        sc += 15
-
-    # === LOGIKA PER TIER LIKUIDITAS (berbasis temuan empiris) ===
-    # Tier A (likuid): momentum berlaku. Searah tren = konfirmasi kuat.
-    # Tier C (tipis):  reversal dominan. Searah tren TIDAK bisa diandalkan,
-    #                  dan harga yang sudah bergerak jauh justru rawan balik.
-    # Jarak antar tier SENGAJA kecil (15/12/9). Alasan: bukti empiris soal
-    # momentum-vs-reversal berasal dari horizon HARIAN, sementara kita pakai
-    # 15m-4h. Menerapkan beda bobot besar = overclaim atas bukti yang ada.
-    # Tier menggeser peringkat, tidak mendominasi.
-    if tier == 'A':
-        if counter:                     sc -= 22
-        elif trend in ('UP', 'DOWN'):   sc += 15
-    elif tier == 'B':
-        if counter:                     sc -= 18
-        elif trend in ('UP', 'DOWN'):   sc += 12
-    else:  # tier C
-        if counter:                     sc -= 14
-        elif trend in ('UP', 'DOWN'):   sc += 9
-        if timing == 'EXTENDED':        sc -= 10
+    # Tren: bobot seragam untuk semua koin (tier dihapus - lihat catatan di atas).
+    if counter:
+        sc -= 20
+    elif trend in ('UP', 'DOWN'):
+        sc += 14
     # TIMING = LABEL SAJA, TIDAK mempengaruhi skor.
     #
     # Versi sebelumnya memberi bonus +12 untuk DINI dan penalti -15 untuk
@@ -481,7 +451,7 @@ async def screen(s, it, sem, st):
             'fr_extreme': fr_ext, 'fr_note': fr_note,
             'timing': timing,
             'trend': trend, 'tr_emoji': tr_emoji,
-            'counter': counter, 'tier': tier, 'tv': it.get('tv', 0),
+            'counter': counter, 'tv': it.get('tv', 0),
             'oi_z': oi_z, 'oi_persist': oi_persist,
             'oi_pat': oi_pat, 'oi_pat_emoji': oi_pat_emoji,
             'fs': fs, 'fe': fe, 'lsr': lsr, 'sq': sq,
@@ -509,8 +479,6 @@ def fmt(r, i):
         warn.append("sisi ramai, rawan cascade")
     if r.get('fr_extreme'):
         warn.append("funding ekstrem")
-    if r.get('tier') == 'C':
-        warn.append("koin tipis")
     if warn:
         out.append("   ⚠️ " + " · ".join(warn))
     return "\n".join(out)
