@@ -52,7 +52,7 @@ MIN_TURNOVER, MIN_TF, MAX_SYM, TOPN = 1_000_000, 1, 400, 10
 # universe sudah tersaring ke koin yang listed di Bybit, sehingga koin
 # benar-benar tipis praktis sudah tidak masuk.
 # Angka volume TETAP ditampilkan sebagai fakta mentah tanpa tafsiran.
-MIN_SCORE = 50   # kandidat di bawah ini tidak dikirim (kurangi kebisingan)
+MIN_SCORE = 40   # kandidat di bawah ini tidak dikirim (kurangi kebisingan)
 
 # Token SAHAM / KOMODITAS / FOREX di Gate.io — BUKAN crypto.
 # Dibuang karena: (a) bukan instrumen yang kamu tradingkan, (b) saat bursa
