@@ -1,167 +1,237 @@
 """
-oi_screener.py — Screener OI × Harga (4-Quadrant) + Funding Overlay
+oi_screener.py — Screener OI × Harga (4-Quadrant) + Funding + Long/Short Ratio
+Sumber data: Gate.io v4 (tidak kena geo-block GitHub Actions)
+Verifikasi silang: Bybit instruments-info (hanya tampilkan yang tradable di Bybit)
+
 Modul TERPISAH dari screener.py (Apex Quant v7.1). Additive-only.
 
-TUJUAN: screening MANUAL. Output = daftar kandidat + label setup untuk
-kamu cek chart sendiri. BUKAN sinyal entry otomatis, BUKAN rekomendasi.
+=============================================================================
+KENAPA ARSITEKTURNYA BEGINI
+=============================================================================
+- Bybit /v5/market/tickers TERBUKTI 403 dari runner GitHub Actions (tes 14 Sep
+  2026). Jadi Bybit tidak bisa dipakai sebagai sumber universe/OI/funding.
+- Gate.io TERBUKTI jalan dari runner yang sama (screener.py sudah 5 bulan).
+- TAPI Gate.io punya 1.700+ perpetual vs Bybit yang jauh lebih sedikit →
+  mayoritas coin Gate.io TIDAK ADA di Bybit. Karena eksekusi trading kamu di
+  Bybit, kandidat yang tidak tradable di sana = sampah.
+  → Solusi: ambil data dari Gate.io, lalu SARING pakai daftar simbol Bybit.
 
 =============================================================================
-DASAR KONSEPTUAL (dan batasnya — baca ini sebelum percaya outputnya)
+DASAR KONSEPTUAL
 =============================================================================
-
-Framework 4-kuadran OI × Harga adalah kerangka MEKANIS yang diakui luas di
-literatur trading derivatif:
-
+Framework 4-kuadran OI × Harga:
     Harga ↑ + OI ↑ = LONG BUILDUP    → uang baru masuk long
     Harga ↓ + OI ↑ = SHORT BUILDUP   → uang baru masuk short
     Harga ↑ + OI ↓ = SHORT COVERING  → short keluar (bullish, kurang tahan lama)
-    Harga ↓ + OI ↓ = LONG UNWINDING  → long keluar (lemah, bukan serangan bear)
+    Harga ↓ + OI ↓ = LONG UNWINDING  → long keluar (lemah)
 
-Prinsip kunci: OI TANPA konteks harga tidak punya arah. Ini memperbaiki
-cacat desain versi pertama file ini, yang hanya mengecek "OI naik" tanpa
-melihat harga — sehingga long buildup dan short buildup tercampur jadi satu.
+OI TANPA konteks harga tidak punya arah. Funding rate = sinyal CROWDING,
+bukan sinyal ARAH: ekstrem di satu sisi = sisi itu rapuh terhadap cascade.
 
-Funding rate adalah sinyal CROWDING, bukan sinyal ARAH. Funding ekstrem
-(±0.05%–0.1% per 8 jam) menandakan satu sisi terlalu ramai dan rapuh:
-gerakan kecil melawan bisa memicu liquidation cascade.
+⚠️ TIDAK ADA KLAIM EDGE/PROFIT. Semua threshold BELUM dikalibrasi backtest.
+   Framework ini DESKRIPTIF (di mana uang terposisi sekarang), bukan
+   PREDIKTIF (ke mana harga akan bergerak).
 
-⚠️ YANG TIDAK DIKLAIM DI SINI:
-   - Tidak ada bukti bahwa kombinasi ini menghasilkan edge/profit.
-   - Semua THRESHOLD di bawah adalah ANGKA AWAL yang belum dikalibrasi
-     dengan backtest. Perlakukan sebagai titik mulai untuk dikalibrasi
-     sendiri dari data, bukan angka yang sudah terbukti.
-   - Framework ini deskriptif (menggambarkan posisi pasar saat ini),
-     bukan prediktif.
+⚠️ CATATAN VERIFIKASI: nama field Gate.io contract_stats (open_interest,
+   lsr_account, dll) disusun dari dokumentasi publik tapi BELUM diverifikasi
+   langsung terhadap respons API riil. Script ini punya mode diagnostik
+   (DIAGNOSTIC_MODE=True) yang mencetak struktur respons mentah — jalankan
+   sekali dengan mode itu kalau ada field yang ternyata beda nama.
 =============================================================================
 """
 
 import os
 import asyncio
 import logging
+import json
 import aiohttp
-import pandas as pd
 import numpy as np
 from datetime import datetime, timezone
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Env var TERPISAH dari screener.py (TELEGRAM_TOKEN/TELEGRAM_CHAT_ID)
 TG_TOKEN   = (os.getenv('OI_TELEGRAM_TOKEN')   or '').strip()
 TG_CHAT_ID = (os.getenv('OI_TELEGRAM_CHAT_ID') or '').strip()
 
-# ── THRESHOLD (BELUM DIKALIBRASI — kalibrasi sendiri dari data) ──────────
-OI_CHANGE_MIN_PCT    = 2.0    # % perubahan OI minimum agar dianggap "bergerak"
-PRICE_CHANGE_MIN_PCT = 0.5    # % perubahan harga minimum agar dianggap "bergerak"
-RVOL_MIN             = 1.3    # volume relatif minimum (validasi sinyal)
-FUNDING_EXTREME      = 0.0005 # 0.05% per 8 jam — batas "crowded"
-FUNDING_VERY_EXTREME = 0.0010 # 0.10% per 8 jam — batas "sangat crowded"
-MIN_TURNOVER_24H     = 3_000_000   # USD, buang koin terlalu tipis untuk ditradingkan
-MIN_TF_CONSISTENCY   = 2      # kuadran sama harus muncul di >= N timeframe
+# Set True untuk mencetak struktur respons API mentah (cek nama field).
+# Jalankan sekali dengan ini True kalau ada data yang kosong terus.
+DIAGNOSTIC_MODE = os.getenv('OI_DIAGNOSTIC', '').strip().lower() == 'true'
 
-# Timeframe yang dicek. Bybit intervalTime untuk OI: 5min,15min,30min,1h,4h,1d
+# ── THRESHOLD (BELUM DIKALIBRASI — ubah setelah lihat hasil nyata) ──────
+OI_CHANGE_MIN_PCT    = 2.0     # % perubahan OI minimum agar dianggap bergerak
+PRICE_CHANGE_MIN_PCT = 0.5     # % perubahan harga minimum agar dianggap bergerak
+RVOL_MIN             = 1.3     # volume relatif minimum (validasi sinyal)
+FUNDING_EXTREME      = 0.0005  # 0.05%/8h — batas "crowded"
+FUNDING_VERY_EXTREME = 0.0010  # 0.10%/8h — batas "sangat crowded"
+LSR_EXTREME_HI       = 2.0     # long/short account ratio > ini = long ramai
+LSR_EXTREME_LO       = 0.5     # < ini = short ramai
+MIN_TURNOVER_24H     = 3_000_000   # USD — buang pair terlalu tipis
+MIN_TF_CONSISTENCY   = 2       # kuadran sama harus muncul di >= N timeframe
+MAX_SYMBOLS_SCANNED  = 300     # batas atas agar runtime & rate limit terkendali
+
+# Timeframe: (label, interval_gate_kline, detik_per_candle)
 TIMEFRAMES = [
-    # (label, bybit_oi_interval, bybit_kline_interval, jumlah candle)
-    ('15m', '15min', '15',  3),
-    ('1h',  '1h',    '60',  3),
-    ('4h',  '4h',    '240', 3),
+    ('15m', '15m', 900),
+    ('1h',  '1h',  3600),
+    ('4h',  '4h',  14400),
 ]
 
 SEMAPHORE_LIMIT = 6
 MAX_RETRIES     = 3
-RETRY_DELAY     = 4
+RETRY_DELAY     = 3
 TIMEOUT_SEC     = 15
-TOP_N_REPORT    = 8     # berapa kandidat per kategori dikirim ke Telegram
+TOP_N_REPORT    = 8
 
+GATE_BASE  = "https://api.gateio.ws/api/v4/futures/usdt"
 BYBIT_BASE = "https://api.bybit.com/v5/market"
 
 
-# ── HTTP ─────────────────────────────────────────────────────────────────
-async def _get(session, path, params):
-    url = f"{BYBIT_BASE}/{path}"
+# ── HTTP ────────────────────────────────────────────────────────────────
+async def _get(session, url, params=None, label=""):
     for attempt in range(MAX_RETRIES):
         try:
             async with session.get(url, params=params,
                                    timeout=aiohttp.ClientTimeout(total=TIMEOUT_SEC)) as r:
                 if r.status == 200:
-                    data = await r.json()
-                    if data.get('retCode') == 0:
-                        return data.get('result', {})
-                    return None
+                    return await r.json()
                 if r.status in (403, 451):
-                    logging.error(f"HTTP {r.status} dari {url} — kemungkinan blokir region. "
-                                  f"Cek apakah runner GitHub Actions kena geo-block Bybit.")
+                    logging.warning(f"HTTP {r.status} dari {label or url} — geo-block.")
                     return None
+                if r.status == 429:
+                    await asyncio.sleep(RETRY_DELAY * 2)
+                    continue
         except Exception as e:
-            logging.debug(f"fetch error {url}: {e}")
+            logging.debug(f"fetch error {label or url}: {e}")
         if attempt < MAX_RETRIES - 1:
             await asyncio.sleep(RETRY_DELAY)
     return None
 
 
-# ── UNIVERSE ─────────────────────────────────────────────────────────────
-async def fetch_universe(session):
-    """Semua USDT perpetual Bybit + turnover 24h, difilter likuiditas minimum.
-    Universe LUAS (tanpa filter market cap) sesuai kebutuhan screening manual,
-    tapi tetap buang yang terlalu tipis untuk ditradingkan."""
-    res = await _get(session, "tickers", {"category": "linear"})
-    if not res:
+# ── LAPIS 1: daftar simbol yang TRADABLE DI BYBIT (verifikasi silang) ───
+async def fetch_bybit_symbols(session):
+    """Ambil daftar simbol USDT perp Bybit. Kalau endpoint ini juga kena 403,
+    script tetap jalan tapi TANPA filter Bybit — dan itu dilaporkan jelas
+    di pesan Telegram, bukan disembunyikan."""
+    data = await _get(session, f"{BYBIT_BASE}/instruments-info",
+                      {"category": "linear", "limit": 1000},
+                      label="Bybit instruments-info")
+    if not data or data.get('retCode') != 0:
+        logging.warning("Daftar simbol Bybit TIDAK bisa diambil — "
+                        "filter ketersediaan Bybit DINONAKTIFKAN untuk run ini.")
+        return None
+    syms = {
+        it['symbol'] for it in data.get('result', {}).get('list', [])
+        if it.get('symbol', '').endswith('USDT') and it.get('status') == 'Trading'
+    }
+    logging.info(f"Bybit: {len(syms)} simbol USDT perp tradable")
+    return syms
+
+
+def gate_to_bybit_symbol(contract):
+    """BTC_USDT (Gate) → BTCUSDT (Bybit)"""
+    return contract.replace('_', '')
+
+
+# ── LAPIS 2: universe dari Gate.io ──────────────────────────────────────
+async def fetch_gate_universe(session, bybit_symbols):
+    data = await _get(session, f"{GATE_BASE}/tickers", label="Gate tickers")
+    if not data:
         return []
-    out = []
-    for it in res.get('list', []):
-        sym = it.get('symbol', '')
-        if not sym.endswith('USDT'):
+
+    if DIAGNOSTIC_MODE and data:
+        logging.info(f"[DIAG] Struktur tickers Gate: {json.dumps(data[0], indent=2)[:600]}")
+
+    out, skipped_not_on_bybit = [], 0
+    for it in data:
+        contract = it.get('contract', '')
+        if not contract.endswith('_USDT'):
             continue
+        bybit_sym = gate_to_bybit_symbol(contract)
+
+        # Filter ketersediaan Bybit — inti dari verifikasi silang
+        if bybit_symbols is not None and bybit_sym not in bybit_symbols:
+            skipped_not_on_bybit += 1
+            continue
+
         try:
-            turnover = float(it.get('turnover24h') or 0)
+            turnover = float(it.get('volume_24h_quote') or 0)
+            last     = float(it.get('last') or 0)
+            funding  = float(it.get('funding_rate') or 0)
         except (TypeError, ValueError):
             continue
-        if turnover < MIN_TURNOVER_24H:
+        if turnover < MIN_TURNOVER_24H or last <= 0:
             continue
-        out.append({'symbol': sym, 'turnover24h': turnover})
+
+        out.append({
+            'contract':    contract,
+            'bybit_symbol': bybit_sym,
+            'turnover24h': turnover,
+            'funding':     funding,   # Gate tickers sudah bawa funding_rate
+        })
+
     out.sort(key=lambda x: x['turnover24h'], reverse=True)
-    logging.info(f"Universe: {len(out)} pair USDT perp (turnover >= ${MIN_TURNOVER_24H:,.0f})")
+    out = out[:MAX_SYMBOLS_SCANNED]
+    logging.info(f"Universe: {len(out)} pair (dibuang karena tidak ada di Bybit: "
+                 f"{skipped_not_on_bybit})")
     return out
 
 
-# ── DATA PER TIMEFRAME ───────────────────────────────────────────────────
-async def fetch_oi_change(session, symbol, oi_interval):
-    """% perubahan OI antara 2 titik terakhir."""
-    res = await _get(session, "open-interest", {
-        "category": "linear", "symbol": symbol,
-        "intervalTime": oi_interval, "limit": 2
-    })
-    if not res:
+# ── LAPIS 3: OI + long/short ratio dari Gate contract_stats ─────────────
+async def fetch_contract_stats(session, contract, interval, limit=3):
+    """Gate contract_stats: OI, long/short ratio, dll per interval."""
+    data = await _get(session, f"{GATE_BASE}/contract_stats",
+                      {"contract": contract, "interval": interval, "limit": limit},
+                      label="Gate contract_stats")
+    if not data or not isinstance(data, list) or len(data) < 2:
+        return None, None
+
+    if DIAGNOSTIC_MODE:
+        logging.info(f"[DIAG] contract_stats {contract}: "
+                     f"{json.dumps(data[0], indent=2)[:600]}")
+
+    # Gate mengembalikan urutan lama→baru
+    latest, prev = data[-1], data[-2]
+
+    def _f(d, *keys):
+        """Ambil nilai dari key pertama yang ada — defensif terhadap
+        perbedaan nama field antar versi API."""
+        for k in keys:
+            v = d.get(k)
+            if v is not None:
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    continue
         return None
-    rows = res.get('list', [])
-    if len(rows) < 2:
-        return None
+
+    oi_now  = _f(latest, 'open_interest_usd', 'open_interest')
+    oi_prev = _f(prev,   'open_interest_usd', 'open_interest')
+    oi_chg  = None
+    if oi_now is not None and oi_prev and oi_prev > 0:
+        oi_chg = ((oi_now - oi_prev) / oi_prev) * 100.0
+
+    lsr = _f(latest, 'lsr_account', 'long_short_ratio', 'lsr_taker')
+    return oi_chg, lsr
+
+
+# ── LAPIS 4: kline dari Gate (harga + volume) ──────────────────────────
+async def fetch_gate_kline(session, contract, interval, limit=25):
+    data = await _get(session, f"{GATE_BASE}/candlesticks",
+                      {"contract": contract, "interval": interval, "limit": limit},
+                      label="Gate candlesticks")
+    if not data or not isinstance(data, list) or len(data) < 21:
+        return None, None
+
+    if DIAGNOSTIC_MODE:
+        logging.info(f"[DIAG] candlestick {contract}: "
+                     f"{json.dumps(data[0], indent=2)[:400]}")
+
     try:
-        latest = float(rows[0]['openInterest'])   # Bybit: terbaru dulu
-        prev   = float(rows[1]['openInterest'])
+        closes = np.array([float(r['c']) for r in data])
+        vols   = np.array([float(r['v']) for r in data])
     except (KeyError, TypeError, ValueError):
-        return None
-    if prev <= 0:
-        return None
-    return ((latest - prev) / prev) * 100.0
+        return None, None
 
-
-async def fetch_kline_metrics(session, symbol, kline_interval, limit=25):
-    """% perubahan harga candle terakhir + RVOL terhadap rata-rata 20."""
-    res = await _get(session, "kline", {
-        "category": "linear", "symbol": symbol,
-        "interval": kline_interval, "limit": str(limit)
-    })
-    if not res:
-        return None, None
-    rows = res.get('list', [])
-    if len(rows) < 21:
-        return None, None
-    rows = list(reversed(rows))  # jadikan kronologis
-    try:
-        closes = np.array([float(r[4]) for r in rows])
-        vols   = np.array([float(r[5]) for r in rows])
-    except (IndexError, TypeError, ValueError):
-        return None, None
     if closes[-2] <= 0:
         return None, None
     price_chg = ((closes[-1] - closes[-2]) / closes[-2]) * 100.0
@@ -170,203 +240,201 @@ async def fetch_kline_metrics(session, symbol, kline_interval, limit=25):
     return price_chg, rvol
 
 
-async def fetch_funding(session, symbol):
-    res = await _get(session, "funding/history", {
-        "category": "linear", "symbol": symbol, "limit": 1
-    })
-    if not res:
-        return None
-    rows = res.get('list', [])
-    if not rows:
-        return None
-    try:
-        return float(rows[0]['fundingRate'])
-    except (KeyError, TypeError, ValueError):
-        return None
-
-
-# ── KLASIFIKASI 4 KUADRAN ────────────────────────────────────────────────
+# ── KLASIFIKASI ─────────────────────────────────────────────────────────
 def classify_quadrant(price_chg, oi_chg):
-    """Kuadran OI × Harga. NEUTRAL kalau gerakan terlalu kecil untuk dibaca."""
     if price_chg is None or oi_chg is None:
         return None
     if abs(price_chg) < PRICE_CHANGE_MIN_PCT or abs(oi_chg) < OI_CHANGE_MIN_PCT:
         return 'NEUTRAL'
-    if price_chg > 0 and oi_chg > 0:
-        return 'LONG_BUILDUP'
-    if price_chg < 0 and oi_chg > 0:
-        return 'SHORT_BUILDUP'
-    if price_chg > 0 and oi_chg < 0:
-        return 'SHORT_COVERING'
+    if price_chg > 0 and oi_chg > 0:  return 'LONG_BUILDUP'
+    if price_chg < 0 and oi_chg > 0:  return 'SHORT_BUILDUP'
+    if price_chg > 0 and oi_chg < 0:  return 'SHORT_COVERING'
     return 'LONG_UNWINDING'
 
 
 def funding_state(fr):
-    """Funding = sinyal CROWDING, bukan arah."""
     if fr is None:
-        return 'UNKNOWN', ''
-    if fr >= FUNDING_VERY_EXTREME:
-        return 'LONG_VERY_CROWDED', '🔴'
-    if fr >= FUNDING_EXTREME:
-        return 'LONG_CROWDED', '🟠'
-    if fr <= -FUNDING_VERY_EXTREME:
-        return 'SHORT_VERY_CROWDED', '🔴'
-    if fr <= -FUNDING_EXTREME:
-        return 'SHORT_CROWDED', '🟠'
+        return 'UNKNOWN', '⚪'
+    if fr >= FUNDING_VERY_EXTREME:   return 'LONG_VERY_CROWDED',  '🔴'
+    if fr >= FUNDING_EXTREME:        return 'LONG_CROWDED',       '🟠'
+    if fr <= -FUNDING_VERY_EXTREME:  return 'SHORT_VERY_CROWDED', '🔴'
+    if fr <= -FUNDING_EXTREME:       return 'SHORT_CROWDED',      '🟠'
     return 'BALANCED', '🟢'
 
 
-# ── SCREENING PER SYMBOL ─────────────────────────────────────────────────
+def lsr_state(lsr):
+    if lsr is None:               return 'UNKNOWN'
+    if lsr >= LSR_EXTREME_HI:     return 'LONG_HEAVY'
+    if lsr <= LSR_EXTREME_LO:     return 'SHORT_HEAVY'
+    return 'BALANCED'
+
+
+# ── SCREENING PER SIMBOL ────────────────────────────────────────────────
 async def screen_symbol(session, item, sem):
-    symbol = item['symbol']
+    contract = item['contract']
     async with sem:
-        tf_results = {}
-        for label, oi_int, kl_int, _ in TIMEFRAMES:
-            oi_chg = await fetch_oi_change(session, symbol, oi_int)
-            price_chg, rvol = await fetch_kline_metrics(session, symbol, kl_int)
-            tf_results[label] = {
+        tf_data = {}
+        for label, interval, _ in TIMEFRAMES:
+            oi_chg, lsr   = await fetch_contract_stats(session, contract, interval)
+            price_chg, rv = await fetch_gate_kline(session, contract, interval)
+            tf_data[label] = {
                 'oi_chg':    oi_chg,
                 'price_chg': price_chg,
-                'rvol':      rvol,
+                'rvol':      rv,
+                'lsr':       lsr,
                 'quadrant':  classify_quadrant(price_chg, oi_chg),
             }
-        funding = await fetch_funding(session, symbol)
 
-    # Konsistensi: kuadran apa yang paling sering muncul lintas timeframe?
-    quads = [v['quadrant'] for v in tf_results.values()
+    quads = [v['quadrant'] for v in tf_data.values()
              if v['quadrant'] and v['quadrant'] != 'NEUTRAL']
     if not quads:
         return None
-    dominant = max(set(quads), key=quads.count)
+    dominant    = max(set(quads), key=quads.count)
     consistency = quads.count(dominant)
+
     if consistency < MIN_TF_CONSISTENCY:
         return None
     if dominant not in ('LONG_BUILDUP', 'SHORT_BUILDUP'):
-        return None   # sesuai keputusan: hanya tampilkan dua kuadran buildup
+        return None  # hanya dua kuadran buildup, sesuai keputusan
 
     # Validasi volume: OI bergerak tanpa volume = sinyal lemah
-    # (bisa hasil satu-dua transaksi besar, bukan partisipasi pasar riil)
-    rvol_1h = tf_results.get('1h', {}).get('rvol') or 0.0
+    rvol_1h = tf_data.get('1h', {}).get('rvol') or 0.0
     if rvol_1h < RVOL_MIN:
         return None
 
+    funding = item.get('funding')
     fstate, femoji = funding_state(funding)
+    lsr = tf_data.get('1h', {}).get('lsr')
+    lstate = lsr_state(lsr)
 
-    # Squeeze watch: buildup yang funding-nya crowded SEARAH posisinya.
+    # SQUEEZE WATCH: buildup yang sisi ramainya SEARAH posisi itu sendiri.
     # Long buildup + long crowded  → rally bergantung leverage, rawan cascade.
     # Short buildup + short crowded → short ramai, rawan short squeeze.
-    squeeze_watch = (
-        (dominant == 'LONG_BUILDUP'  and fstate in ('LONG_CROWDED',  'LONG_VERY_CROWDED')) or
-        (dominant == 'SHORT_BUILDUP' and fstate in ('SHORT_CROWDED', 'SHORT_VERY_CROWDED'))
+    squeeze = (
+        (dominant == 'LONG_BUILDUP'  and (fstate in ('LONG_CROWDED', 'LONG_VERY_CROWDED')
+                                          or lstate == 'LONG_HEAVY')) or
+        (dominant == 'SHORT_BUILDUP' and (fstate in ('SHORT_CROWDED', 'SHORT_VERY_CROWDED')
+                                          or lstate == 'SHORT_HEAVY'))
     )
 
-    # Skor kualitas SINYAL (bukan skor profit) — seberapa bersih pembacaannya
-    score = 0
-    score += consistency * 15                      # konsistensi lintas TF
-    score += min(int(rvol_1h * 10), 25)            # dukungan volume
-    avg_oi = np.mean([abs(v['oi_chg']) for v in tf_results.values()
-                      if v['oi_chg'] is not None])
-    score += min(int(avg_oi * 2), 20)              # besarnya pergerakan OI
+    # Skor KUALITAS PEMBACAAN (bukan skor profit)
+    score = consistency * 15
+    score += min(int(rvol_1h * 10), 25)
+    ois = [abs(v['oi_chg']) for v in tf_data.values() if v['oi_chg'] is not None]
+    if ois:
+        score += min(int(np.mean(ois) * 2), 20)
     if fstate == 'BALANCED':
-        score += 10                                # tidak crowded = lebih bersih
+        score += 10
     score = max(0, min(100, score))
 
     return {
-        'symbol':      symbol,
-        'quadrant':    dominant,
-        'consistency': f"{consistency}/{len(TIMEFRAMES)}",
-        'funding':     funding,
+        'contract':     contract,
+        'symbol':       item['bybit_symbol'],
+        'quadrant':     dominant,
+        'consistency':  consistency,
+        'tf_total':     len(TIMEFRAMES),
+        'funding':      funding,
         'funding_state': fstate,
         'funding_emoji': femoji,
-        'squeeze_watch': squeeze_watch,
-        'rvol_1h':     round(rvol_1h, 2),
-        'score':       score,
-        'tf':          tf_results,
-        'turnover24h': item['turnover24h'],
+        'lsr':          lsr,
+        'lsr_state':    lstate,
+        'squeeze':      squeeze,
+        'rvol_1h':      round(rvol_1h, 2),
+        'score':        score,
+        'tf':           tf_data,
+        'turnover24h':  item['turnover24h'],
     }
 
 
-# ── FORMAT TELEGRAM ──────────────────────────────────────────────────────
-QUAD_LABEL = {
-    'LONG_BUILDUP':  ('🟢 LONG BUILDUP',  'Setup LONG — uang baru masuk posisi long'),
-    'SHORT_BUILDUP': ('🔴 SHORT BUILDUP', 'Setup SHORT — uang baru masuk posisi short'),
+# ── OUTPUT TELEGRAM ─────────────────────────────────────────────────────
+QUAD = {
+    'LONG_BUILDUP':  ('🟢 LONG BUILDUP',
+                      'Setup LONG — harga naik, OI naik: uang baru masuk posisi long'),
+    'SHORT_BUILDUP': ('🔴 SHORT BUILDUP',
+                      'Setup SHORT — harga turun, OI naik: uang baru masuk posisi short'),
+}
+FUND_LBL = {
+    'BALANCED': 'seimbang', 'LONG_CROWDED': 'long ramai',
+    'LONG_VERY_CROWDED': 'long SANGAT ramai', 'SHORT_CROWDED': 'short ramai',
+    'SHORT_VERY_CROWDED': 'short SANGAT ramai', 'UNKNOWN': 'n/a',
+}
+LSR_LBL = {
+    'LONG_HEAVY': 'akun mayoritas long', 'SHORT_HEAVY': 'akun mayoritas short',
+    'BALANCED': 'akun seimbang', 'UNKNOWN': '',
 }
 
-FUNDING_LABEL = {
-    'BALANCED':           'seimbang',
-    'LONG_CROWDED':       'long ramai',
-    'LONG_VERY_CROWDED':  'long SANGAT ramai',
-    'SHORT_CROWDED':      'short ramai',
-    'SHORT_VERY_CROWDED': 'short SANGAT ramai',
-    'UNKNOWN':            'n/a',
-}
 
-
-def _fmt_coin(r, idx):
-    tf1h = r['tf'].get('1h', {})
-    oi   = tf1h.get('oi_chg')
-    pc   = tf1h.get('price_chg')
-    fr_pct = f"{r['funding']*100:+.4f}%" if r['funding'] is not None else "n/a"
+def _fmt(r, i):
+    t = r['tf'].get('1h', {})
+    oi, pc = t.get('oi_chg'), t.get('price_chg')
+    oi_s = f"{oi:+.2f}%" if oi is not None else "n/a"
+    pc_s = f"{pc:+.2f}%" if pc is not None else "n/a"
+    fr_s = f"{r['funding']*100:+.4f}%" if r['funding'] is not None else "n/a"
+    lsr_s = f" | L/S {r['lsr']:.2f}" if r['lsr'] is not None else ""
     return (
-        f"{idx}. <b>{r['symbol']}</b> — Skor {r['score']}/100\n"
-        f"   1h: OI {oi:+.2f}% | Harga {pc:+.2f}% | RVOL {r['rvol_1h']}x\n"
-        f"   Konsistensi TF: {r['consistency']} | "
-        f"Funding {fr_pct} {r['funding_emoji']} ({FUNDING_LABEL[r['funding_state']]})"
+        f"{i}. <b>{r['symbol']}</b> · Skor {r['score']}/100\n"
+        f"   1h: OI {oi_s} | Harga {pc_s} | RVOL {r['rvol_1h']}x\n"
+        f"   TF konsisten {r['consistency']}/{r['tf_total']} | "
+        f"Funding {fr_s} {r['funding_emoji']}{lsr_s}"
     )
 
 
-def build_message(results):
+def build_message(results, bybit_filter_active):
     now = datetime.now(timezone.utc).astimezone()
-    header = (
-        f"📡 <b>OI QUADRANT SCREENER</b>\n"
-        f"🕐 {now.strftime('%d %b %Y, %H:%M')} | Bybit USDT-Perp\n"
-        f"📊 Kandidat: {len(results)}\n"
-        f"{'─'*30}"
-    )
+    longs   = [r for r in results if r['quadrant'] == 'LONG_BUILDUP'  and not r['squeeze']]
+    shorts  = [r for r in results if r['quadrant'] == 'SHORT_BUILDUP' and not r['squeeze']]
+    squeeze = [r for r in results if r['squeeze']]
+
+    filter_note = ("✅ difilter: hanya coin tradable di Bybit"
+                   if bybit_filter_active
+                   else "⚠️ filter Bybit TIDAK aktif — sebagian coin mungkin tidak ada di Bybit")
+
+    p = [
+        f"📡 <b>OI QUADRANT SCREENER</b>",
+        f"🕐 {now.strftime('%d %b %Y, %H:%M')} WIB",
+        f"📊 Data: Gate.io | {filter_note}",
+        f"🎯 Kandidat: {len(results)} "
+        f"(long {len(longs)} · short {len(shorts)} · squeeze {len(squeeze)})",
+        "─" * 28,
+    ]
+
     if not results:
-        return header + "\n\nTidak ada kandidat yang lolos filter siklus ini."
-
-    longs   = [r for r in results if r['quadrant'] == 'LONG_BUILDUP'  and not r['squeeze_watch']]
-    shorts  = [r for r in results if r['quadrant'] == 'SHORT_BUILDUP' and not r['squeeze_watch']]
-    squeeze = [r for r in results if r['squeeze_watch']]
-
-    parts = [header]
+        p.append("\nTidak ada kandidat lolos filter siklus ini.")
+        return "\n".join(p)
 
     for bucket, key in ((longs, 'LONG_BUILDUP'), (shorts, 'SHORT_BUILDUP')):
         if not bucket:
             continue
-        title, desc = QUAD_LABEL[key]
-        parts.append(f"\n<b>{title}</b>\n<i>{desc}</i>\n")
+        title, desc = QUAD[key]
+        p.append(f"\n<b>{title}</b>")
+        p.append(f"<i>{desc}</i>\n")
         for i, r in enumerate(bucket[:TOP_N_REPORT], 1):
-            parts.append(_fmt_coin(r, i))
+            p.append(_fmt(r, i))
 
     if squeeze:
-        parts.append(
-            "\n<b>⚡ SQUEEZE WATCH</b>\n"
-            "<i>Buildup TAPI funding ekstrem — sisi yang ramai ini rapuh. "
-            "Gerakan kecil melawan bisa memicu liquidation cascade. "
-            "Bukan sinyal masuk, ini kandidat pengamatan.</i>\n"
-        )
+        p.append("\n<b>⚡ SQUEEZE WATCH</b>")
+        p.append("<i>Ada buildup TAPI sisi itu sudah terlalu ramai (funding/LSR "
+                 "ekstrem). Posisi rapuh: gerakan kecil melawan bisa memicu "
+                 "liquidation cascade. Kandidat PENGAMATAN, bukan sinyal masuk.</i>\n")
         for i, r in enumerate(squeeze[:TOP_N_REPORT], 1):
             side = "long" if r['quadrant'] == 'LONG_BUILDUP' else "short"
-            parts.append(_fmt_coin(r, i) + f"\n   ⚠️ sisi {side} crowded")
+            extra = LSR_LBL.get(r['lsr_state'], '')
+            p.append(_fmt(r, i) + f"\n   ⚠️ sisi {side} crowded"
+                                   + (f" · {extra}" if extra else ""))
 
-    parts.append(
-        f"\n{'─'*30}\n"
-        "<i>Screening deskriptif, bukan rekomendasi. "
-        "Threshold belum dikalibrasi backtest — cek chart sendiri sebelum ambil posisi.</i>"
-    )
-    return "\n".join(parts)
+    p.append("\n" + "─" * 28)
+    p.append("<i>Deskriptif, bukan rekomendasi. Threshold belum dikalibrasi "
+             "backtest. Cek chart sendiri sebelum ambil posisi.</i>")
+    return "\n".join(p)
 
 
 async def send_telegram(session, text):
     if not TG_TOKEN or not TG_CHAT_ID:
         logging.warning("OI_TELEGRAM_TOKEN / OI_TELEGRAM_CHAT_ID kosong — "
                         "hasil dicetak ke log saja.")
-        print(text)
+        print("\n" + text)
         return
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    # Telegram batas ~4096 char, pecah kalau kepanjangan
     chunks, cur = [], ""
     for line in text.split("\n"):
         if len(cur) + len(line) + 1 > 3800:
@@ -382,39 +450,46 @@ async def send_telegram(session, text):
                 "parse_mode": "HTML", "disable_web_page_preview": True
             }, timeout=aiohttp.ClientTimeout(total=20)) as r:
                 if r.status != 200:
-                    logging.error(f"Telegram gagal: HTTP {r.status} — {await r.text()}")
+                    logging.error(f"Telegram HTTP {r.status}: {await r.text()}")
+                else:
+                    logging.info("Pesan terkirim ke Telegram.")
         except Exception as e:
             logging.error(f"Telegram error: {e}")
         await asyncio.sleep(0.4)
 
 
-# ── MAIN ─────────────────────────────────────────────────────────────────
+# ── MAIN ────────────────────────────────────────────────────────────────
 async def main():
-    async with aiohttp.ClientSession() as session:
-        universe = await fetch_universe(session)
+    async with aiohttp.ClientSession(headers={'Accept': 'application/json'}) as session:
+        bybit_symbols = await fetch_bybit_symbols(session)
+        universe = await fetch_gate_universe(session, bybit_symbols)
+
         if not universe:
-            logging.error("Universe kosong. Kalau ini karena HTTP 403/451, "
-                          "artinya IP runner kena geo-block Bybit — "
-                          "lihat log di atas.")
+            msg = ("📡 <b>OI QUADRANT SCREENER</b>\n\n"
+                   "❌ Universe kosong — Gate.io tickers tidak bisa diambil. "
+                   "Cek log GitHub Actions untuk detail error.")
+            logging.error("Universe kosong dari Gate.io.")
+            await send_telegram(session, msg)
             return
 
         sem = asyncio.Semaphore(SEMAPHORE_LIMIT)
-        tasks = [screen_symbol(session, it, sem) for it in universe]
-        raw = await asyncio.gather(*tasks, return_exceptions=True)
+        raw = await asyncio.gather(
+            *[screen_symbol(session, it, sem) for it in universe],
+            return_exceptions=True
+        )
 
         results = []
         for r in raw:
             if isinstance(r, Exception):
                 logging.debug(f"task error: {r}")
-                continue
-            if r:
+            elif r:
                 results.append(r)
 
         results.sort(key=lambda x: x['score'], reverse=True)
-        logging.info(f"Kandidat lolos: {len(results)} dari {len(universe)} pair")
+        logging.info(f"Kandidat lolos: {len(results)} dari {len(universe)} pair dipindai")
 
-        msg = build_message(results)
-        await send_telegram(session, msg)
+        await send_telegram(session,
+                            build_message(results, bybit_symbols is not None))
 
 
 if __name__ == "__main__":
