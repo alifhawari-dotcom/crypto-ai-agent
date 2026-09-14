@@ -328,15 +328,6 @@ def quad(px, oi):
     return 'LONG_UNWINDING'
 
 
-def fstate(fr):
-    if fr is None: return 'UNKNOWN', 'x'
-    if fr >= FUND_VEXT: return 'LONG_VCROWD', '[!!]'
-    if fr >= FUND_EXT: return 'LONG_CROWD', '[!]'
-    if fr <= -FUND_VEXT: return 'SHORT_VCROWD', '[!!]'
-    if fr <= -FUND_EXT: return 'SHORT_CROWD', '[!]'
-    return 'BALANCED', 'ok'
-
-
 
 
 def pick_tf(r_tf, dom):
@@ -419,6 +410,26 @@ async def screen(s, it, sem, st):
                (dom in ('SHORT_BUILDUP', 'LONG_UNWINDING') and trend == 'UP'))
 
     sc = con * 15 + min(int(rv1 * 10), 25)
+
+    # --- POLA OI: akumulasi bertahap vs lonjakan mendadak ---
+    # Akumulasi sedikit lebih tinggi (lebih sulit dipalsukan satu pihak),
+    # tapi lonjakan tetap dihargai karena bisa menandai informasi baru.
+    oi_pat, oi_pat_emoji = None, ''
+    long_side = dom in ('LONG_BUILDUP', 'SHORT_COVERING')
+    aligned_persist = (oi_persist is not None and
+                       ((long_side and oi_persist >= 0.75) or
+                        (not long_side and oi_persist <= 0.25)))
+    spike = oi_z is not None and abs(oi_z) >= 2.5
+
+    if aligned_persist and not spike:
+        oi_pat, oi_pat_emoji = 'AKUMULASI', '🧱'
+        sc += 12
+    elif spike and not aligned_persist:
+        oi_pat, oi_pat_emoji = 'LONJAKAN', '⚡'
+        sc += 8
+    elif aligned_persist and spike:
+        oi_pat, oi_pat_emoji = 'AKUM+LONJAK', '🧱⚡'
+        sc += 15
 
     # Tren: bobot seragam untuk semua koin (tier dihapus - lihat catatan di atas).
     if counter:
@@ -555,6 +566,15 @@ async def main():
               '_oi_vals': [], '_px_vals': []}
         raw = await asyncio.gather(*[screen(s, i, sem, st) for i in uni],
                                    return_exceptions=True)
+        # Error di dalam task JANGAN ditelan diam-diam. Sebelumnya bug
+        # NameError membuat semua task gagal dan hasilnya "0 kandidat" tanpa
+        # petunjuk apa pun di log.
+        errs = [r for r in raw if isinstance(r, Exception)]
+        if errs:
+            from collections import Counter
+            cnt = Counter(f"{type(e).__name__}: {e}" for e in errs)
+            for msg, n in cnt.most_common(3):
+                logging.error(f"TASK GAGAL x{n} -> {msg}")
         res = [r for r in raw if r and not isinstance(r, Exception)]
         res.sort(key=lambda x: x['sc'], reverse=True)
 
@@ -604,3 +624,13 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+def fstate(fr):
+    if fr is None: return 'UNKNOWN', 'x'
+    if fr >= FUND_VEXT: return 'LONG_VCROWD', '[!!]'
+    if fr >= FUND_EXT: return 'LONG_CROWD', '[!]'
+    if fr <= -FUND_VEXT: return 'SHORT_VCROWD', '[!!]'
+    if fr <= -FUND_EXT: return 'SHORT_CROWD', '[!]'
+    return 'BALANCED', 'ok'
+
+
