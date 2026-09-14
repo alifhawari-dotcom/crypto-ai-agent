@@ -23,6 +23,11 @@ DETAIL = os.getenv('OI_DETAIL', '').strip().lower() == 'true'
 OI_MIN, PX_MIN, RVOL_MIN = 0.08, 0.25, 1.0
 FUND_EXT, FUND_VEXT = 0.0005, 0.0010
 LSR_HI, LSR_LO = 2.0, 0.5
+# TIMING: bedakan sinyal DINI (OI bergerak, harga belum) vs TERLAMBAT
+# (harga sudah jauh bergerak). Rasio = |OI%| / |Px%|.
+# Tinggi = posisi dibangun tapi harga belum ikut -> masih dini.
+LEAD_RATIO_EARLY = 1.5     # OI bergerak >=1.5x lebih besar dari harga
+PX_EXTENDED      = 8.0     # harga sudah bergerak >= ini % -> dianggap telat
 # Universe DIPERLEBAR (14 Sep 2026): turnover min $3jt -> $500rb.
 # Aman karena filter Bybit jadi penyaring kualitas: Bybit melisting jauh
 # lebih sedikit coin dari Gate.io (1.700+), jadi yang lolos sudah melewati
@@ -233,6 +238,17 @@ def fstate(fr):
     return 'BALANCED', 'ok'
 
 
+def pick_tf(r_tf, dom):
+    """TF representatif: yang kuadrannya cocok label & volumenya paling kuat.
+    Dipakai BERSAMA oleh perhitungan timing dan tampilan Telegram, supaya
+    label tidak pernah dihitung dari TF berbeda dengan angka yang dibaca user."""
+    cands = [(lb, t) for lb, t in r_tf.items()
+             if t.get('q') == dom and t.get('px') is not None]
+    if cands:
+        return max(cands, key=lambda x: (x[1].get('rv') or 0))
+    return '1h', r_tf.get('1h', {})
+
+
 async def screen(s, it, sem, st):
     async with sem:
         oimap, lsr_v, tlsr_v = await stats_oi_series(s, it['c'])
@@ -284,7 +300,25 @@ async def screen(s, it, sem, st):
         side = "long" if fr > 0 else "short"
         fr_note = f"{side} bayar sangat mahal - potensi squeeze {('turun' if fr > 0 else 'naik')}"
 
+    # --- TIMING SCORE ---
+    # Pakai TF yang SAMA dengan yang nanti ditampilkan di Telegram.
+    tf_lb, t_used = pick_tf(tf, dom)
+    px_abs = abs(t_used.get('px') or 0)
+    oi_abs = abs(t_used.get('oi') or 0)
+    lead = (oi_abs / px_abs) if px_abs > 0.01 else 0
+    if px_abs >= PX_EXTENDED:
+        timing, t_emoji = 'EXTENDED', '🕐'
+    elif lead >= LEAD_RATIO_EARLY:
+        timing, t_emoji = 'EARLY', '🌱'
+    else:
+        timing, t_emoji = 'ONGOING', '▶️'
+
     sc = con * 15 + min(int(rv1 * 10), 25)
+    # Timing mempengaruhi skor: dini diberi bonus, terlambat diberi penalti.
+    if timing == 'EARLY':
+        sc += 12
+    elif timing == 'EXTENDED':
+        sc -= 15
     # Exit-flow (posisi keluar) secara literatur lebih lemah/ambigu dibanding
     # buildup (uang baru masuk) -> penalti agar urutan skor mencerminkan itu.
     if dom in ('LONG_UNWINDING', 'SHORT_COVERING'):
@@ -296,6 +330,8 @@ async def screen(s, it, sem, st):
         sc += 10
     return {'sym': it['sym'], 'q': dom, 'con': con, 'ntf': len(TFS), 'fr': fr,
             'fr_extreme': fr_ext, 'fr_note': fr_note,
+            'timing': timing, 't_emoji': t_emoji, 'lead': round(lead, 1),
+            'tf_used': tf_lb,
             'fs': fs, 'fe': fe, 'lsr': lsr, 'tlsr': tlsr, 'sq': sq,
             'rv': round(rv1, 2), 'sc': max(0, min(100, sc)), 'tf': tf}
 
@@ -303,13 +339,8 @@ async def screen(s, it, sem, st):
 def fmt(r, i):
     """Default RINGKAS (2 baris). Set OI_DETAIL=true untuk rincian per-TF.
     TF yang ditampilkan = TF yang mendukung label, dengan RVOL tertinggi."""
-    # pilih TF representatif: yang kuadrannya cocok label & RVOL paling kuat
-    cands = [(lb, t) for lb, t in r['tf'].items()
-             if t.get('q') == r['q'] and t.get('px') is not None]
-    if cands:
-        lb, t = max(cands, key=lambda x: (x[1].get('rv') or 0))
-    else:
-        lb, t = '1h', r['tf'].get('1h', {})
+    # TF yang sama persis dengan yang dipakai menghitung timing
+    lb, t = pick_tf(r['tf'], r['q'])
 
     px = f"{t['px']:+.1f}%" if t.get('px') is not None else "n/a"
     oi = f"{t['oi']:+.2f}%" if t.get('oi') is not None else "n/a"
@@ -317,10 +348,15 @@ def fmt(r, i):
     fr = f"{r['fr']*100:+.3f}%" if r['fr'] is not None else "n/a"
     ls = f" · L/S {r['lsr']:.2f}" if r['lsr'] is not None else ""
 
-    out = [f"<b>{i}. {r['sym']}</b>  ·  {r['sc']}/100  ·  TF {r['con']}/{r['ntf']}",
+    tmg = r.get('t_emoji', '')
+    out = [f"<b>{i}. {r['sym']}</b>  ·  {r['sc']}/100  ·  TF {r['con']}/{r['ntf']}  {tmg}",
            f"    {lb}  Px {px} · OI {oi} · Vol {rv}",
            f"    Fund {fr}{ls}"]
 
+    if r.get('timing') == 'EARLY':
+        out.append(f"   🌱 DINI — OI {r['lead']}x lebih cepat dari harga")
+    elif r.get('timing') == 'EXTENDED':
+        out.append(f"   🕐 TERLAMBAT — harga sudah bergerak jauh")
     if r.get('fr_extreme'):
         out.append(f"   🚨 {r['fr_note']}")
     if r.get('sq'):
@@ -445,7 +481,7 @@ async def main():
                          f"terkonfirmasi ada di Bybit")
             if ok_n > 0:
                 logging.info(f"Filter Bybit (via kline): {len(keep)} lolos, "
-                             f"{dropped} dibuang (tidak ada di Bybit)")
+f"{dropped} dibuang (tidak ada di Bybit)")
                 res = keep
                 bybit_ok = True
             else:
@@ -473,3 +509,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+                
