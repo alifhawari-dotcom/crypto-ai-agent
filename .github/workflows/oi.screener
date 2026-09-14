@@ -1,0 +1,51 @@
+# .github/workflows/oi-screener.yml
+#
+# Workflow TERPISAH dari "Apex Quant v7.1 Screener" (screener.py).
+# Tidak menyentuh file workflow screener.py yang sudah ada — additive-only.
+#
+# Cara pasang:
+#   1. Taruh file ini di .github/workflows/oi-screener.yml
+#   2. Taruh oi_screener.py di root repo (sejajar screener.py)
+#   3. Tambahkan dua secret baru di GitHub repo Settings > Secrets and
+#      variables > Actions:
+#        OI_TELEGRAM_TOKEN
+#        OI_TELEGRAM_CHAT_ID
+#      (bot Telegram BARU via BotFather — supaya notifikasi OI-screener
+#      tidak campur di chat yang sama dengan Apex Quant v7.1)
+#   4. Commit, push, lalu trigger manual dulu lewat tab Actions untuk TES
+#      endpoint sebelum mengandalkan jadwal cron otomatis.
+
+name: OI/Funding/LS-Ratio Screener
+
+on:
+  schedule:
+    # screener.py jalan tiap 4 jam di menit :00 (0 */4 * * *).
+    # Ini jalan TIAP JAM di menit :30 — tidak pernah bentrok dengan menit :00,
+    # jadi tidak rebutan rate limit Bybit dengan screener.py.
+    - cron: "30 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: oi-screener-flow   # nama grup BEDA dari apex-screener-flow milik screener.py
+  cancel-in-progress: true
+
+jobs:
+  oi_screener_job:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: pip install aiohttp pandas numpy
+
+      - name: Run OI/Funding/LS-Ratio Screener
+        env:
+          OI_TELEGRAM_TOKEN: ${{ secrets.OI_TELEGRAM_TOKEN }}
+          OI_TELEGRAM_CHAT_ID: ${{ secrets.OI_TELEGRAM_CHAT_ID }}
+        run: python oi_screener.py
