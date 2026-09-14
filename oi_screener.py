@@ -236,6 +236,37 @@ async def kline(s, c, iv):
     return px, rv
 
 
+async def trend_4h(s, c):
+    """Konteks TREN dari 4h: harga vs EMA20 vs EMA50.
+    DIKEMBALIKAN setelah sempat hilang saat migrasi Bybit->Gate.io.
+    Tanpa ini, sinyal 'LONG BUILDUP' bisa muncul di tengah tren turun
+    (rebound kecil terbaca sebagai buildup) - persis kasus VIRTUAL 14 Sep."""
+    d = await _get(s, f"{GATE}/candlesticks",
+                   {"contract": c, "interval": "4h", "limit": 60}, "Gate 4h trend")
+    if not d or not isinstance(d, list) or len(d) < 51:
+        return 'UNKNOWN', ''
+    try:
+        d = sorted(d, key=lambda x: int(x.get('t', 0)))
+        cl = np.array([float(r['c']) for r in d])
+    except (KeyError, TypeError, ValueError):
+        return 'UNKNOWN', ''
+
+    def ema(a, n):
+        k = 2.0 / (n + 1)
+        e = a[0]
+        for v in a[1:]:
+            e = v * k + e * (1 - k)
+        return e
+
+    px = cl[-2]                 # candle tertutup terakhir
+    e20, e50 = ema(cl, 20), ema(cl, 50)
+    if px > e20 > e50:
+        return 'UP', '📈'
+    if px < e20 < e50:
+        return 'DOWN', '📉'
+    return 'RANGE', '↔️'
+
+
 def quad(px, oi):
     if px is None or oi is None:
         return None
@@ -257,6 +288,7 @@ def fstate(fr):
 
 
 
+
 def pick_tf(r_tf, dom):
     """TF representatif: yang kuadrannya cocok label & volumenya paling kuat.
     Dipakai BERSAMA oleh perhitungan timing dan tampilan Telegram, supaya
@@ -271,6 +303,7 @@ def pick_tf(r_tf, dom):
 async def screen(s, it, sem, st):
     async with sem:
         oimap, lsr_v, tlsr_v = await stats_oi_series(s, it['c'])
+        trend, tr_emoji = await trend_4h(s, it['c'])
         tf = {}
         for lb, iv in TFS:
             px, rv = await kline(s, it['c'], iv)
@@ -332,12 +365,31 @@ async def screen(s, it, sem, st):
     else:
         timing, t_emoji = 'ONGOING', '▶️'
 
+    # MELAWAN TREN: long buildup saat tren turun, atau sebaliknya.
+    # Bukan otomatis salah, tapi risikonya beda - harus terlihat jelas.
+    counter = ((dom in ('LONG_BUILDUP', 'SHORT_COVERING') and trend == 'DOWN') or
+               (dom in ('SHORT_BUILDUP', 'LONG_UNWINDING') and trend == 'UP'))
+
     sc = con * 15 + min(int(rv1 * 10), 25)
-    # Timing mempengaruhi skor: dini diberi bonus, terlambat diberi penalti.
-    if timing == 'EARLY':
-        sc += 12
-    elif timing == 'EXTENDED':
-        sc -= 15
+    # TREN diberi bobot BESAR: kelanjutan tren punya dasar literatur yang
+    # jauh lebih kuat daripada hipotesis "OI mendahului harga".
+    if counter:
+        sc -= 25
+    elif trend in ('UP', 'DOWN'):
+        sc += 15
+    # TIMING = LABEL SAJA, TIDAK mempengaruhi skor.
+    #
+    # Versi sebelumnya memberi bonus +12 untuk DINI dan penalti -15 untuk
+    # TERLAMBAT. Itu ASUMSI mean-reversion yang TIDAK pernah diverifikasi,
+    # dan efeknya justru menurunkan kualitas urutan: sinyal "terlambat"
+    # sebenarnya adalah sinyal yang sudah TERKONFIRMASI (tren + volume
+    # nyata), sementara "dini" masih hipotesis menunggu konfirmasi.
+    # Menghukum yang terbukti dan menghadiahi yang belum terbukti = terbalik.
+    #
+    # Kalau suatu saat kamu punya data hasil trading nyata yang menunjukkan
+    # DINI memang lebih baik, aktifkan lagi lewat dua baris di bawah.
+    # if timing == 'EARLY':    sc += 12
+    # elif timing == 'EXTENDED': sc -= 15
     # Exit-flow (posisi keluar) secara literatur lebih lemah/ambigu dibanding
     # buildup (uang baru masuk) -> penalti agar urutan skor mencerminkan itu.
     if dom in ('LONG_UNWINDING', 'SHORT_COVERING'):
@@ -350,7 +402,8 @@ async def screen(s, it, sem, st):
     return {'sym': it['sym'], 'q': dom, 'con': con, 'ntf': len(TFS), 'fr': fr,
             'fr_extreme': fr_ext, 'fr_note': fr_note,
             'timing': timing, 't_emoji': t_emoji, 'lead': round(lead, 1),
-            'tf_used': tf_lb,
+            'tf_used': tf_lb, 'trend': trend, 'tr_emoji': tr_emoji,
+            'counter': counter,
             'fs': fs, 'fe': fe, 'lsr': lsr, 'tlsr': tlsr, 'sq': sq,
             'rv': round(rv1, 2), 'sc': max(0, min(100, sc)), 'tf': tf}
 
@@ -368,10 +421,14 @@ def fmt(r, i):
     ls = f" · L/S {r['lsr']:.2f}" if r['lsr'] is not None else ""
 
     tmg = r.get('t_emoji', '')
-    out = [f"<b>{i}. {r['sym']}</b>  ·  {r['sc']}/100  ·  TF {r['con']}/{r['ntf']}  {tmg}",
+    trd = r.get('tr_emoji', '')
+    out = [f"<b>{i}. {r['sym']}</b>  ·  {r['sc']}/100  ·  TF {r['con']}/{r['ntf']}  {tmg}{trd}",
            f"    {lb}  Px {px} · OI {oi} · Vol {rv}",
            f"    Fund {fr}{ls}"]
 
+    if r.get('counter'):
+        tr = 'turun' if r.get('trend') == 'DOWN' else 'naik'
+        out.append(f"   ⛔ MELAWAN TREN 4h ({tr}) — risiko lebih tinggi")
     if r.get('timing') == 'EARLY':
         out.append(f"   🌱 DINI — OI {r['lead']}x lebih cepat dari harga")
     elif r.get('timing') == 'EXTENDED':
@@ -529,3 +586,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
