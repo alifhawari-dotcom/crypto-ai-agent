@@ -42,7 +42,7 @@ PX_EXTENDED      = 8.0     # harga sudah bergerak >= ini % -> dianggap telat
 # menunjukkan koin tidak likuid didominasi efek REVERSAL harian, bukan
 # momentum. Koin sangat tipis dibuang lewat ambang ini; sisanya diperlakukan
 # sama (lihat catatan penghapusan tier di bawah).
-MIN_TURNOVER, MIN_TF, MAX_SYM, TOPN = 1_000_000, 2, 400, 10
+MIN_TURNOVER, MIN_TF, MAX_SYM, TOPN = 1_000_000, 1, 400, 10
 
 # CATATAN: klasifikasi tier likuiditas DIHAPUS 14 Sep 2026.
 # Alasan: proxy-nya (turnover Gate.io) tidak mengukur likuiditas pasar yang
@@ -70,7 +70,7 @@ NON_CRYPTO = {
     # komoditas / forex
     'XAU','XAG','XAUT','PAXG','OIL','GOLD','SILVER',
 }
-TFS = [('1h','1h'), ('4h','4h')]
+TFS = [('1h','1h'),('1h','1h'),('4h','4h')]
 SEM_N, RETRIES, DELAY, TMO = 12, 3, 3, 15
 GATE = "https://api.gateio.ws/api/v4/futures/usdt"
 BYBIT = "https://api.bybit.com/v5/market"
