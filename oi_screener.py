@@ -21,9 +21,14 @@ DIAG = os.getenv('OI_DIAGNOSTIC', '').strip().lower() == 'true'
 OI_MIN, PX_MIN, RVOL_MIN = 0.08, 0.25, 1.0
 FUND_EXT, FUND_VEXT = 0.0005, 0.0010
 LSR_HI, LSR_LO = 2.0, 0.5
-MIN_TURNOVER, MIN_TF, MAX_SYM, TOPN = 3_000_000, 2, 300, 8
+# Universe DIPERLEBAR (14 Sep 2026): turnover min $3jt -> $500rb.
+# Aman karena filter Bybit jadi penyaring kualitas: Bybit melisting jauh
+# lebih sedikit coin dari Gate.io (1.700+), jadi yang lolos sudah melewati
+# standar listing Bybit. MAX_SYM dinaikkan, semaphore dinaikkan agar runtime
+# tetap wajar (tiap simbol = 6 panggilan API).
+MIN_TURNOVER, MIN_TF, MAX_SYM, TOPN = 500_000, 2, 400, 10
 TFS = [('15m','15m'), ('1h','1h'), ('4h','4h')]
-SEM_N, RETRIES, DELAY, TMO = 6, 3, 3, 15
+SEM_N, RETRIES, DELAY, TMO = 12, 3, 3, 15
 GATE = "https://api.gateio.ws/api/v4/futures/usdt"
 BYBIT = "https://api.bybit.com/v5/market"
 
@@ -204,6 +209,15 @@ async def screen(s, it, sem, st):
     sq = ((dom == 'LONG_BUILDUP' and (fs in ('LONG_CROWD', 'LONG_VCROWD') or lhi)) or
           (dom == 'SHORT_BUILDUP' and (fs in ('SHORT_CROWD', 'SHORT_VCROWD') or llo)))
 
+    # Funding ekstrem ke arah MANA PUN = informasi penting, harus ditandai.
+    # (Bug versi lama: hanya ditandai kalau crowding SEARAH dengan buildup,
+    #  sehingga funding -2% pada long buildup lolos tanpa peringatan.)
+    fr_ext, fr_note = False, ""
+    if fr is not None and abs(fr) >= FUND_VEXT * 3:
+        fr_ext = True
+        side = "long" if fr > 0 else "short"
+        fr_note = f"{side} bayar sangat mahal - potensi squeeze {('turun' if fr > 0 else 'naik')}"
+
     sc = con * 15 + min(int(rv1 * 10), 25)
     ois = [abs(v['oi']) for v in tf.values() if v['oi'] is not None]
     if ois:
@@ -211,20 +225,30 @@ async def screen(s, it, sem, st):
     if fs == 'BALANCED':
         sc += 10
     return {'sym': it['sym'], 'q': dom, 'con': con, 'ntf': len(TFS), 'fr': fr,
+            'fr_extreme': fr_ext, 'fr_note': fr_note,
             'fs': fs, 'fe': fe, 'lsr': lsr, 'tlsr': tlsr, 'sq': sq,
             'rv': round(rv1, 2), 'sc': max(0, min(100, sc)), 'tf': tf}
 
 
 def fmt(r, i):
-    t = r['tf'].get('1h', {})
-    oi = f"{t['oi']:+.2f}%" if t.get('oi') is not None else "n/a"
-    px = f"{t['px']:+.2f}%" if t.get('px') is not None else "n/a"
+    """Tampilkan SEMUA timeframe, dengan penanda TF mana yang mendukung label.
+    (Bug versi lama: selalu menampilkan angka 1h, padahal label ditentukan dari
+     mayoritas lintas TF -> angka bisa kontradiktif dengan labelnya.)"""
+    lines = [f"{i}. <b>{r['sym']}</b> · Skor {r['sc']}/100"]
+    for lb, _ in TFS:
+        t = r['tf'].get(lb, {})
+        oi = f"{t['oi']:+.2f}%" if t.get('oi') is not None else "n/a"
+        px = f"{t['px']:+.2f}%" if t.get('px') is not None else "n/a"
+        rv = f"{t['rv']:.1f}x" if t.get('rv') is not None else "n/a"
+        mark = "✓" if t.get('q') == r['q'] else " "
+        lines.append(f"   {mark}{lb}: OI {oi} | Px {px} | RV {rv}")
     fr = f"{r['fr']*100:+.4f}%" if r['fr'] is not None else "n/a"
     ls = f" | L/S {r['lsr']:.2f}" if r['lsr'] is not None else ""
     tl = f" | topL/S {r['tlsr']:.2f}" if r['tlsr'] is not None else ""
-    return (f"{i}. <b>{r['sym']}</b> · Skor {r['sc']}/100\n"
-            f"   1h: OI {oi} | Harga {px} | RVOL {r['rv']}x\n"
-            f"   TF {r['con']}/{r['ntf']} | Funding {fr} {r['fe']}{ls}{tl}")
+    lines.append(f"   TF cocok {r['con']}/{r['ntf']} | Funding {fr} {r['fe']}{ls}{tl}")
+    if r.get('fr_extreme'):
+        lines.append(f"   🚨 FUNDING EKSTREM ({r['fr_note']})")
+    return "\n".join(lines)
 
 
 def build(res, bfilter):
@@ -315,10 +339,10 @@ async def main():
         bybit_ok = bs is not None   # sudah terfilter di tahap universe?
         if not bybit_ok and res:
             checks = await asyncio.gather(
-                *[on_bybit(s, r['sym']) for r in res[:40]],
+                *[on_bybit(s, r['sym']) for r in res[:60]],
                 return_exceptions=True)
             keep, dropped = [], 0
-            for r, ok in zip(res[:40], checks):
+            for r, ok in zip(res[:60], checks):
                 if ok is True:
                     keep.append(r)
                 else:
