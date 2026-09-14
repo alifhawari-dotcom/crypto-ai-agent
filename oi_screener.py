@@ -10,7 +10,10 @@ TG_TOKEN = (os.getenv('OI_TELEGRAM_TOKEN') or '').strip()
 TG_CHAT = (os.getenv('OI_TELEGRAM_CHAT_ID') or '').strip()
 DIAG = os.getenv('OI_DIAGNOSTIC', '').strip().lower() == 'true'
 
-OI_MIN, PX_MIN, RVOL_MIN = 0.8, 0.3, 1.1
+# Kalibrasi #2 (14 Sep 2026): run 03:49 WIB -> 74/77 pair gugur NEUTRAL
+# dengan OI_MIN=0.8/PX_MIN=0.3. Diturunkan lagi. Sesi dini hari memang sepi,
+# jadi angka ini mungkin masih perlu disesuaikan setelah lihat sesi ramai.
+OI_MIN, PX_MIN, RVOL_MIN = 0.3, 0.15, 1.0
 FUND_EXT, FUND_VEXT = 0.0005, 0.0010
 LSR_HI, LSR_LO = 2.0, 0.5
 MIN_TURNOVER, MIN_TF, MAX_SYM, TOPN = 3_000_000, 2, 300, 8
@@ -48,6 +51,19 @@ async def bybit_syms(s):
           if i.get('symbol', '').endswith('USDT') and i.get('status') == 'Trading'}
     logging.info(f"Bybit: {len(sy)} simbol tradable")
     return sy
+
+
+async def on_bybit(s, sym):
+    """Cek apakah simbol tradable di Bybit lewat endpoint KLINE — satu-satunya
+    endpoint Bybit yang terbukti lolos geo-block dari GitHub Actions.
+    Dipanggil HANYA untuk kandidat yang sudah lolos screening (jumlahnya
+    sedikit), jadi ringan dan tidak memicu rate limit."""
+    d = await _get(s, f"{BYBIT}/kline",
+                   {"category": "linear", "symbol": sym, "interval": "60", "limit": 1},
+                   f"Bybit kline {sym}")
+    if not d or d.get('retCode') != 0:
+        return False
+    return bool(d.get('result', {}).get('list'))
 
 
 async def universe(s, bsyms):
@@ -151,6 +167,13 @@ async def screen(s, it, sem, st):
             px, rv = await kline(s, it['c'], iv)
             tf[lb] = {'oi': oi, 'px': px, 'rv': rv, 'lsr': lsr,
                       'tlsr': tlsr, 'q': quad(px, oi)}
+    # Rekam nilai riil 1h untuk laporan distribusi (dasar kalibrasi threshold)
+    t1 = tf.get('1h', {})
+    if t1.get('oi') is not None:
+        st['_oi_vals'].append(abs(t1['oi']))
+    if t1.get('px') is not None:
+        st['_px_vals'].append(abs(t1['px']))
+
     if all(v['oi'] is None for v in tf.values()):
         st['no_oi'] += 1; return None
     qs = [v['q'] for v in tf.values() if v['q'] and v['q'] != 'NEUTRAL']
@@ -275,17 +298,52 @@ async def main():
             return
         sem = asyncio.Semaphore(SEM_N)
         st = {'no_oi': 0, 'neutral': 0, 'inconsist': 0,
-              'not_buildup': 0, 'low_rvol': 0, 'pass': 0}
+              'not_buildup': 0, 'low_rvol': 0, 'pass': 0,
+              '_oi_vals': [], '_px_vals': []}
         raw = await asyncio.gather(*[screen(s, i, sem, st) for i in uni],
                                    return_exceptions=True)
         res = [r for r in raw if r and not isinstance(r, Exception)]
         res.sort(key=lambda x: x['sc'], reverse=True)
+
+        # FILTER BYBIT (lapis akhir): buang kandidat yang tidak tradable di
+        # Bybit. Pakai kline karena tickers/instruments-info kena geo-block.
+        bybit_ok = bs is not None   # sudah terfilter di tahap universe?
+        if not bybit_ok and res:
+            checks = await asyncio.gather(
+                *[on_bybit(s, r['sym']) for r in res[:40]],
+                return_exceptions=True)
+            keep, dropped = [], 0
+            for r, ok in zip(res[:40], checks):
+                if ok is True:
+                    keep.append(r)
+                else:
+                    dropped += 1
+            if any(c is True for c in checks if not isinstance(c, Exception)):
+                logging.info(f"Filter Bybit (via kline): {len(keep)} lolos, "
+                             f"{dropped} dibuang (tidak ada di Bybit)")
+                res = keep
+                bybit_ok = True
+            else:
+                logging.warning("Cek Bybit via kline gagal total — "
+                                "filter tidak diterapkan.")
         logging.info(
             f"FUNNEL {len(uni)} pair -> tanpa OI:{st['no_oi']} | "
             f"NEUTRAL:{st['neutral']} | TF tak konsisten:{st['inconsist']} | "
             f"bukan buildup:{st['not_buildup']} | RVOL rendah:{st['low_rvol']} | "
             f"LOLOS:{st['pass']}")
-        await send(s, build(res, bs is not None))
+
+        # DISTRIBUSI NYATA -> dasar kalibrasi threshold, bukan tebakan.
+        # Baca persentil: kalau mau ~20% pair lolos, set threshold di p80.
+        for nm, vals, cur in (('OI%', st['_oi_vals'], OI_MIN),
+                              ('PX%', st['_px_vals'], PX_MIN)):
+            if vals:
+                a = np.array(vals)
+                logging.info(
+                    f"DISTRIBUSI {nm} (1h, n={len(a)}) threshold_kini={cur} -> "
+                    f"p50={np.percentile(a,50):.3f} p70={np.percentile(a,70):.3f} "
+                    f"p80={np.percentile(a,80):.3f} p90={np.percentile(a,90):.3f} "
+                    f"max={a.max():.3f}")
+        await send(s, build(res, bybit_ok))
 
 
 if __name__ == "__main__":
