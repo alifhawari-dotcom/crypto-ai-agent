@@ -120,7 +120,9 @@ async def stats_oi(s, c, iv):
     if not d or not isinstance(d, list) or len(d) < 2:
         return None, None, None
     if DIAG:
-        logging.info(f"[DIAG] stats {c}: {json.dumps(d[0])[:400]}")
+        _ts = [x.get('time') for x in d]
+        logging.info(f"[DIAG-OI] {c} iv={iv} timestamps={_ts} "
+                     f"selisih={(_ts[-1]-_ts[-2]) if len(_ts)>1 and all(_ts) else 'n/a'}s")
     try:
         d = sorted(d, key=lambda x: x.get('time', 0))
     except Exception:
@@ -133,20 +135,34 @@ async def stats_oi(s, c, iv):
 
 
 async def kline(s, c, iv):
+    """Pakai candle TERAKHIR YANG SUDAH TERTUTUP, bukan yang sedang berjalan.
+    (Bug versi lama: membandingkan candle in-progress dengan rata-rata candle
+     lengkap -> RVOL 4h/15m selalu <1 karena candle-nya memang belum selesai,
+     bukan karena volumenya rendah.)"""
     d = await _get(s, f"{GATE}/candlesticks",
-                   {"contract": c, "interval": iv, "limit": 25}, "Gate candles")
-    if not d or not isinstance(d, list) or len(d) < 21:
+                   {"contract": c, "interval": iv, "limit": 30}, "Gate candles")
+    if not d or not isinstance(d, list) or len(d) < 24:
         return None, None
     try:
+        d = sorted(d, key=lambda x: int(x.get('t', 0)))
         cl = np.array([float(r['c']) for r in d])
         vo = np.array([float(r['v']) for r in d])
+        ts = [int(r.get('t', 0)) for r in d]
     except (KeyError, TypeError, ValueError):
         return None, None
-    if cl[-2] <= 0:
+
+    if DIAG:
+        logging.info(f"[DIAG-TF] {c} iv={iv} n={len(d)} "
+                     f"t_terakhir={ts[-1]} t_sebelum={ts[-2]} "
+                     f"selisih_detik={ts[-1]-ts[-2]} close={cl[-2]:.6f}")
+
+    # index -1 = candle berjalan (dibuang), -2 = candle tertutup terakhir
+    if len(cl) < 24 or cl[-3] <= 0:
         return None, None
-    px = (cl[-1] - cl[-2]) / cl[-2] * 100.0
-    va = vo[-21:-1].mean()
-    return px, (float(vo[-1] / va) if va > 0 else 0.0)
+    px = (cl[-2] - cl[-3]) / cl[-3] * 100.0
+    va = vo[-23:-2].mean()          # 21 candle tertutup sebelum candle -2
+    rv = float(vo[-2] / va) if va > 0 else 0.0
+    return px, rv
 
 
 def quad(px, oi):
