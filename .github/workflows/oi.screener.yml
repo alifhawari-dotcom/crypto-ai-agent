@@ -1,37 +1,28 @@
-# .github/workflows/oi-screener.yml
+# .github/workflows/oi.screener.yml
 #
-# Workflow TERPISAH dari "Apex Quant v7.1 Screener" (screener.py).
-# Tidak menyentuh file workflow screener.py yang sudah ada — additive-only.
-#
-# Cara pasang:
-#   1. Taruh file ini di .github/workflows/oi-screener.yml
-#   2. Taruh oi_screener.py di root repo (sejajar screener.py)
-#   3. Tambahkan dua secret baru di GitHub repo Settings > Secrets and
-#      variables > Actions:
-#        OI_TELEGRAM_TOKEN
-#        OI_TELEGRAM_CHAT_ID
-#      (bot Telegram BARU via BotFather — supaya notifikasi OI-screener
-#      tidak campur di chat yang sama dengan Apex Quant v7.1)
-#   4. Commit, push, lalu trigger manual dulu lewat tab Actions untuk TES
-#      endpoint sebelum mengandalkan jadwal cron otomatis.
+# PEMICU:
+#  1. workflow_dispatch — WAJIB ADA. Ini pintu yang dipakai cron-job.org
+#     (endpoint /actions/workflows/<file>/dispatches). Kalau dihapus,
+#     cron-job.org langsung gagal 422. Juga dipakai untuk Run workflow manual.
+#  2. schedule — cadangan longgar (tiap jam). Sengaja TIDAK 15 menit supaya
+#     tidak tabrakan dengan cron-job.org yang sudah menangani frekuensi tinggi.
+#     Fungsinya jaring pengaman kalau cron-job.org down / token kedaluwarsa.
 
 name: OI/Funding/LS-Ratio Screener
 
 on:
-  schedule:
-    # screener.py jalan tiap 4 jam di menit :00 (0 */4 * * *).
-    # Ini jalan TIAP JAM di menit :30 — tidak pernah bentrok dengan menit :00,
-    # jadi tidak rebutan rate limit Bybit dengan screener.py.
-    - cron: "30 * * * *"
   workflow_dispatch:
+  schedule:
+    - cron: "47 * * * *"
 
 concurrency:
-  group: oi-screener-flow   # nama grup BEDA dari apex-screener-flow milik screener.py
+  group: oi-screener-flow
   cancel-in-progress: true
 
 jobs:
   oi_screener_job:
     runs-on: ubuntu-latest
+    timeout-minutes: 12
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -49,4 +40,5 @@ jobs:
           OI_TELEGRAM_TOKEN: ${{ secrets.OI_TELEGRAM_TOKEN }}
           OI_TELEGRAM_CHAT_ID: ${{ secrets.OI_TELEGRAM_CHAT_ID }}
           OI_DIAGNOSTIC: ${{ secrets.OI_DIAGNOSTIC }}
+          OI_DETAIL: ${{ secrets.OI_DETAIL }}
         run: python oi_screener.py
