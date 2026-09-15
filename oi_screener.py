@@ -271,6 +271,158 @@ async def screen(s, it, sem, st):
             'lsr': lsr, 'lsr_note': lsr_note, 'tv': it['tv']}
 
 
+HL_API = "https://api.hyperliquid.xyz/info"
+VOL_SAMPLE = 12      # berapa koin dipakai menghitung baseline volume
+VOL_DAYS   = 8       # 1 hari berjalan + 7 hari pembanding
+
+
+async def _hl_context(s):
+    """Hyperliquid metaAndAssetCtxs - SATU panggilan POST untuk seluruh
+    universe perp (~224 koin). Gratis, tanpa API key. Dipakai sebagai
+    pembanding lintas-bursa karena Gate.io saja bisa bias (contoh: XLM
+    tercatat tipis di Gate padahal likuid secara global).
+
+    Hyperliquid adalah DEX, jadi kemungkinan tidak kena geo-block seperti
+    Bybit. Kalau gagal, fungsi ini mengembalikan None dan sisanya tetap jalan.
+    """
+    try:
+        async with s.post(HL_API, json={"type": "metaAndAssetCtxs"},
+                          timeout=aiohttp.ClientTimeout(total=TMO)) as r:
+            if r.status != 200:
+                logging.warning(f"Hyperliquid HTTP {r.status}")
+                return None
+            data = await r.json()
+    except Exception as e:
+        logging.warning(f"Hyperliquid gagal: {e}")
+        return None
+
+    if not isinstance(data, list) or len(data) < 2:
+        return None
+    ctxs = data[1]
+    if not isinstance(ctxs, list):
+        return None
+
+    vol = oi = 0.0
+    up = down = 0
+    for c in ctxs:
+        try:
+            v = float(c.get('dayNtlVlm') or 0)
+            o = float(c.get('openInterest') or 0)
+            mk = float(c.get('markPx') or 0)
+            pv = float(c.get('prevDayPx') or 0)
+        except (TypeError, ValueError):
+            continue
+        vol += v
+        oi += o * mk
+        if pv > 0 and mk > 0:
+            if mk > pv:   up += 1
+            elif mk < pv: down += 1
+    return {'vol': vol, 'oi': oi, 'up': up, 'down': down, 'n': len(ctxs)}
+
+
+async def _vol_baseline(s, uni):
+    """Volume hari ini vs rata-rata 7 hari sebelumnya, dari candle 1d.
+
+    Menjawab 'sepi atau ramai' TANPA perlu menyimpan data antar-run:
+    baseline-nya diambil ulang tiap kali dari candle harian. Memakai
+    sampel koin tervolume terbesar agar hemat panggilan API.
+    """
+    today = prev = 0.0
+    ok = 0
+    for it in uni[:VOL_SAMPLE]:
+        d = await _get(s, f"{GATE}/candlesticks",
+                       {"contract": it['c'], "interval": "1d",
+                        "limit": VOL_DAYS}, "Gate 1d")
+        if not d or not isinstance(d, list) or len(d) < 3:
+            continue
+        try:
+            d = sorted(d, key=lambda x: int(x.get('t', 0)))
+            vols = [float(x.get('sum') or x.get('v') or 0) for x in d]
+        except (TypeError, ValueError):
+            continue
+        if len(vols) < 3:
+            continue
+        today += vols[-1]
+        prev += float(np.mean(vols[:-1]))   # rata-rata hari-hari sebelumnya
+        ok += 1
+    if ok == 0 or prev <= 0:
+        return None
+    return today / prev
+
+
+async def market_context(s, uni):
+    """Rangkuman kondisi pasar. INFORMASI SAJA - tidak mempengaruhi screening."""
+    d = await _get(s, f"{GATE}/tickers", lbl="Gate tickers (context)")
+    up = down = 0
+    total_vol = 0.0
+    if d:
+        for i in d:
+            c = i.get('contract', '')
+            if not c.endswith('_USDT') or c.replace('_USDT', '') in NON_CRYPTO:
+                continue
+            try:
+                chg = float(i.get('change_percentage') or 0)
+                vol = float(i.get('volume_24h_quote') or 0)
+            except (TypeError, ValueError):
+                continue
+            if vol < MIN_TURNOVER:
+                continue
+            total_vol += vol
+            if chg > 0:   up += 1
+            elif chg < 0: down += 1
+
+    n = up + down
+    if n == 0:
+        return None
+    pct_up = up / n * 100.0
+    if pct_up >= 60:   regime, emo = "BULLISH", "🟢"
+    elif pct_up <= 40: regime, emo = "BEARISH", "🔴"
+    else:              regime, emo = "NEUTRAL", "⚪"
+
+    ratio = await _vol_baseline(s, uni)
+    hl = await _hl_context(s)
+
+    lsrs = []
+    for it in uni[:10]:
+        try:
+            _, lsr = await oi_series(s, it['c'])
+            if lsr is not None:
+                lsrs.append(lsr)
+        except Exception:
+            pass
+    lsr_avg = float(np.mean(lsrs)) if lsrs else None
+
+    now = datetime.now(timezone.utc).astimezone()
+    weekend = now.weekday() >= 5
+
+    def money(v):
+        return f"${v/1e9:.1f}M" if v >= 1e9 else f"${v/1e6:.0f}jt"
+
+    lines = [f"{emo} <b>{regime}</b> · {pct_up:.0f}% naik ({up}↑/{down}↓)"]
+
+    vol_line = f"Vol Gate {money(total_vol)}"
+    if ratio is not None:
+        if ratio >= 1.3:   tag = "RAMAI"
+        elif ratio <= 0.7: tag = "SEPI"
+        else:              tag = "normal"
+        vol_line += f" · {ratio:.1f}x rata2 7hr ({tag})"
+    if weekend:
+        vol_line += " · ⚠️ akhir pekan"
+    lines.append(vol_line)
+
+    if hl:
+        hl_n = hl['up'] + hl['down']
+        hl_pct = (hl['up'] / hl_n * 100.0) if hl_n else 0
+        lines.append(f"Hyperliquid: vol {money(hl['vol'])} · OI {money(hl['oi'])} "
+                     f"· {hl_pct:.0f}% naik")
+
+    if lsr_avg is not None:
+        lines.append(f"L/S top-10: {lsr_avg:.2f} "
+                     f"(condong {'long' if lsr_avg > 1 else 'short'})")
+
+    return "\n".join(lines)
+
+
 def fmt(r, i):
     px, oi = r['px'], r['oi']
     tv = r['tv']
@@ -288,7 +440,7 @@ def fmt(r, i):
     return "\n".join(out)
 
 
-def build(res):
+def build(res, ctx=None):
     now = datetime.now(timezone.utc).astimezone()
     sq = [r for r in res if r['sq']]
     groups = []
@@ -298,8 +450,10 @@ def build(res):
             _, label, pola = next(v for v in QUAD.values() if v[0] == key)
             groups.append((items, label, pola))
 
-    p = [f"📡 <b>OI SCREENER</b> · {now.strftime('%d %b %H:%M')}",
-         f"<i>syarat: 15m, 1h, 4h semua searah</i>"]
+    p = [f"📡 <b>OI SCREENER</b> · {now.strftime('%d %b %H:%M')}"]
+    if ctx:
+        p.append(ctx)
+    p.append("<i>syarat: 15m, 1h, 4h semua searah</i>")
 
     for items, label, pola in groups:
         p.append(f"\n<b>{label}</b> <i>{pola}</i>")
@@ -372,7 +526,8 @@ async def main():
             f"{st['terlalu_kecil']} | TF tak sepakat:{st['tf_tak_sepakat']} | "
             f"LOLOS:{st['lolos']}")
 
-        await send(s, build(res))
+        ctx = await market_context(s, uni)
+        await send(s, build(res, ctx))
 
 
 if __name__ == "__main__":
