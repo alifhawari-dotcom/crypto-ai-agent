@@ -30,7 +30,10 @@ DIAG     = os.getenv('OI_DIAGNOSTIC', '').strip().lower() == 'true'
 
 # Ambang minimum agar sebuah pergerakan dianggap "ada", bukan noise nol.
 # Sengaja KECIL: tugasnya menyaring pergerakan nyaris-nol, bukan menyeleksi.
-OI_MIN, PX_MIN = 0.10, 0.10
+# Ambang per timeframe: 15m wajar lebih kecil dari 4h.
+# Ambang seragam 0.10 membuat 68 dari 84 pair gugur (15 Sep 2026) -
+# mayoritas karena candle 15m nyaris datar, bukan karena sinyal lemah.
+MIN_MOVE = {'15m': 0.03, '1h': 0.08, '4h': 0.15}
 
 # Funding: batas "crowded" (per 8 jam). Hanya untuk penanda squeeze + catatan.
 FUND_EXT, FUND_VEXT = 0.0005, 0.0010
@@ -235,7 +238,8 @@ async def screen(s, it, sem, st):
         return None
 
     # Semua TF harus melewati ambang minimum (bukan gerakan nyaris-nol)
-    if any(abs(pxmap[lb]) < PX_MIN or abs(oimap[lb]) < OI_MIN for lb, _, _ in TFS):
+    if any(abs(pxmap[lb]) < MIN_MOVE[lb] or abs(oimap[lb]) < MIN_MOVE[lb]
+           for lb, _, _ in TFS):
         st['terlalu_kecil'] += 1
         return None
 
