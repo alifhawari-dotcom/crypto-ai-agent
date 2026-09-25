@@ -1,529 +1,700 @@
-import os
-import asyncio
-import logging
-import aiohttp
-import pandas as pd
-import numpy as np
-from datetime import datetime
+"""OI Quadrant Screener — 4 kuadran OI x Harga, syarat SEMUA timeframe searah.
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+ATURAN (sesuai pola screening manual):
+  LONG BUILDUP    : harga NAIK  + OI NAIK  di 15m, 1h, 4h
+  SHORT BUILDUP   : harga TURUN + OI NAIK  di 15m, 1h, 4h
+  SHORT COVERING  : harga NAIK  + OI TURUN di 15m, 1h, 4h
+  LONG UNWINDING  : harga TURUN + OI TURUN di 15m, 1h, 4h
+  SQUEEZE WATCH   : buildup tapi funding/LSR ekstrem searah posisi -> rapuh
 
-TG_TOKEN   = (os.getenv('TELEGRAM_TOKEN')   or '').strip()
-TG_CHAT_ID = (os.getenv('TELEGRAM_CHAT_ID') or '').strip()
+Kriteria BINER dan bisa diuji: semua TF harus sepakat, tidak ada skor tumpukan
+bobot yang dikarang. Konsekuensinya kandidat SEDIKIT (sering 0-5 per siklus).
+Itu memang sifat kriteria ketat, bukan kegagalan.
 
-# ── CONSTANTS ─────────────────────────────────────────────────
-TOP_COINS_BY_RVOL = 50
-RANKED_CANDIDATES = 12
-CANDLES_REQUIRED  = 100
-ADX_PERIOD        = 14
-ADX_MIN_NUCLEAR   = 18.0
-ADX_MIN_NORMAL    = 22.0
-CORR_WINDOW       = 30
-CORR_THRESHOLD    = 0.78
-EMA_FAST, EMA_SLOW = 20, 50
-SWING_LOOKBACK    = 10
-SEMAPHORE_P1      = 5
-SEMAPHORE_P2      = 3
-PHASE2_DELAY      = 0.3
-MAX_RETRIES       = 3
-RETRY_DELAY       = 5
-WEEKEND_BLACKOUT  = True
-CONV_VALID        = 55
-CONV_HIGH         = 60
-CONV_INST         = 75
+YANG SENGAJA TIDAK DIPAKAI:
+  - Filter/tampilan RVOL (volume) - dibuang atas permintaan
+  - Tier likuiditas - proxy Gate.io tidak mengukur likuiditas pasar riil
+  - EMA tren - redundan, 3 TF searah SUDAH struktur tren
+  - Skor berbobot - tidak ada dasarnya, diganti urutan by kekuatan OI
 
-# Gate.io v4 API — futures USDT perpetual
-GATE_TICKER_URL = "https://api.gateio.ws/api/v4/futures/usdt/tickers"
-GATE_KLINE_URL  = "https://api.gateio.ws/api/v4/futures/usdt/candlesticks"
+Data: Gate.io (Bybit tickers/instruments-info kena geo-block dari GitHub
+Actions). Difilter ke simbol yang tradable di Bybit lewat bybit_symbols.json.
 
-# Bybit kline sebagai fallback
-BYBIT_KLINE_URL = "https://api.bybit.com/v5/market/kline"
-BYBIT_TF_MAP    = {'5m': '5', '15m': '15', '1h': '60'}
-GATE_TF_MAP     = {'5m': '5m', '15m': '15m', '1h': '1h'}
+=== REGIME ALIGNMENT (ditambahkan) ===
+Lapisan tambahan SEBELUM daftar kuadran: skor searah/lawan kondisi market
+secara keseluruhan, dari breadth Gate.io x Hyperliquid (dua sumber independen,
+bukan direkonstruksi dari hasil trade sendiri seperti regime_proxy_score lama).
 
-# ── INDICATORS ────────────────────────────────────────────────
-def calc_atr(df, period=14):
-    high, low, pc = df['high'], df['low'], df['close'].shift(1)
-    tr = pd.concat([high-low, (high-pc).abs(), (low-pc).abs()], axis=1).max(axis=1)
-    median = tr.rolling(50, min_periods=1).median()
-    clean = pd.Series(np.where(tr > median * 4, median, tr), index=df.index)
-    return clean.rolling(period).mean()
+Threshold +-0.30 diambil langsung dari riset 533 trade riwayat manual trading:
+  - Alignment kuat (>0.3) + ditahan sebagai swing (>24 jam): WR 74.5%, mean R +0.975 (n=47)
+  - Alignment lemah/lawan + dipotong di zona intraday (1-24 jam): WR 10.2%, mean R -0.653 (n=118)
+Kalau Gate & Hyperliquid BERTENTANGAN arah, skor ditarik ke 0 (bukan dirata-
+ratakan naif) -- itu sinyal "tidak jelas", bukan "netral". Sama filosofinya
+dengan syarat "3 TF harus sepakat" di kuadran OI di atas.
+Reversal antar-cycle dideteksi dari regime_state.json yang di-commit balik ke
+repo tiap run (lihat CATATAN WORKFLOW di bagian bawah file).
+Kirim di pesan Telegram YANG SAMA -- tidak ada bot/token baru.
+"""
+import os, asyncio, logging, json, aiohttp, numpy as np
+from datetime import datetime, timezone
 
-def calc_rsi(close, period=14):
-    d = close.diff()
-    gain = d.where(d > 0, 0).ewm(alpha=1/period, adjust=False).mean()
-    # FIX: alpha=1/period (bukan 1/1/period yang ada di versi AI lain)
-    loss = (-d.where(d < 0, 0)).ewm(alpha=1/period, adjust=False).mean()
-    return 100 - (100 / (1 + gain / np.where(loss == 0, 1e-9, loss)))
+logging.basicConfig(level=logging.INFO, format='%(asctime)s-%(levelname)s-%(message)s')
+TG_TOKEN = (os.getenv('OI_TELEGRAM_TOKEN') or '').strip()
+TG_CHAT  = (os.getenv('OI_TELEGRAM_CHAT_ID') or '').strip()
+DIAG     = os.getenv('OI_DIAGNOSTIC', '').strip().lower() == 'true'
 
-def calc_ema(close, span):
-    return close.ewm(span=span, adjust=False).mean()
+# Ambang minimum agar sebuah pergerakan dianggap "ada", bukan noise nol.
+# Sengaja KECIL: tugasnya menyaring pergerakan nyaris-nol, bukan menyeleksi.
+# Ambang per timeframe: 15m wajar lebih kecil dari 4h.
+# Ambang seragam 0.10 membuat 68 dari 84 pair gugur (15 Sep 2026) -
+# mayoritas karena candle 15m nyaris datar, bukan karena sinyal lemah.
+MIN_MOVE = {'15m': 0.03, '1h': 0.08, '4h': 0.15}
 
-def calc_macd(close):
-    m = calc_ema(close, 12) - calc_ema(close, 26)
-    s = m.ewm(span=9, adjust=False).mean()
-    return m, s, m - s
+# Funding: batas "crowded" (per 8 jam). Hanya untuk penanda squeeze + catatan.
+FUND_EXT, FUND_VEXT = 0.0005, 0.0010
+LSR_HI, LSR_LO = 2.0, 0.5
 
-def calc_squeeze(df, atr):
-    mean = df['close'].rolling(20).mean()
-    sd   = df['close'].rolling(20).std()
-    return (mean + 2*sd < mean + 1.5*atr) & (mean - 2*sd > mean - 1.5*atr)
+MIN_TURNOVER = 1_000_000     # buang pair yang praktis tidak bisa ditradingkan
+MAX_SYM, TOPN = 400, 10
+TFS = [('15m', '15m', 1), ('1h', '1h', 4), ('4h', '4h', 16)]  # (label, kline, lookback OI)
+SEM_N, RETRIES, DELAY, TMO = 12, 3, 3, 15
 
-def calc_adx(df, period=14):
-    high, low = df['high'], df['low']
-    up, down  = high.diff(), -low.diff()
-    pDM = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=df.index)
-    mDM = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=df.index)
-    atr_raw = calc_atr(df, period).replace(0, np.nan)
-    pDI = 100 * (pDM.ewm(alpha=1/period, adjust=False).mean() / atr_raw)
-    mDI = 100 * (mDM.ewm(alpha=1/period, adjust=False).mean() / atr_raw)
-    dxDenom = (pDI + mDI).replace(0, np.nan)
-    dx  = 100 * (pDI - mDI).abs() / dxDenom
-    val = float(dx.ewm(alpha=1/period, adjust=False).mean().iloc[-1])
-    return round(val, 1) if not np.isnan(val) else 0.0
+GATE  = "https://api.gateio.ws/api/v4/futures/usdt"
+BYBIT = "https://api.bybit.com/v5/market"
+BYBIT_SYMBOLS_FILE = "bybit_symbols.json"
 
-def _find_swings(highs, lows, lookback):
-    sh, sl = [], []
-    n = len(highs)
-    for i in range(lookback, n - lookback):
-        lh = highs[i-lookback:i]; rh = highs[i+1:i+lookback+1]
-        ll = lows[i-lookback:i];  rl = lows[i+1:i+lookback+1]
-        if len(lh)==lookback and len(rh)==lookback and highs[i]>=max(lh) and highs[i]>=max(rh):
-            sh.append(float(highs[i]))
-        if len(ll)==lookback and len(rl)==lookback and lows[i]<=min(ll) and lows[i]<=min(rl):
-            sl.append(float(lows[i]))
-    return sh, sl
+# Regime alignment: threshold & file state (lihat docstring atas untuk dasar riset)
+ALIGN_STRONG = 0.30
+ALIGN_WEAK = -0.30
+REGIME_STATE_FILE = "regime_state.json"
 
-def calc_swing_levels(df, lookback=10):
-    highs, lows = df['high'].values, df['low'].values
-    for lb in range(lookback, 2, -1):
-        sh, sl = _find_swings(highs, lows, lb)
-        if sh and sl:
-            return {'swing_high': sh[-1], 'swing_low': sl[-1]}
-    return {
-        'swing_high': float(df['high'].rolling(20).max().iloc[-1]),
-        'swing_low':  float(df['low'].rolling(20).min().iloc[-1])
-    }
+# Token saham/komoditas di Gate.io - bukan crypto, dibuang.
+NON_CRYPTO = {
+    'NVDA','META','MU','SOXL','SOXS','AVGO','ORCL','IBM','AAOI','INTC','AMD',
+    'TSLA','AAPL','MSFT','GOOGL','AMZN','NFLX','COIN','MSTR','CRWV','ASML',
+    'SNDK','WDC','SKHYNIX','SKHY','SAMSUNG','CXMT','DRAM','4STOCK','LITE',
+    'CRCL','OPENAI','ANTHROPIC','SPX','QQQ','ESPORTS','MVLL','MET','RAVE',
+    'COHR','QCOM','GLW','SPCX','SNXX','BSP','AKE','TSM','ARM','PLTR','SMCI',
+    'DELL','HPQ','STX','KLAC','LRCX','AMAT','NXPI','ADI','TXN','ON','MCHP',
+    'SWKS','QRVO','MRVL','ALAB','CRDO','ANET','CIEN','JNPR','ERIC','NOK','ZM',
+    'SNOW','DDOG','NET','CRWD','PANW','ZS','OKTA','MDB','TEAM','NOW','WDAY',
+    'ADBE','IREN','NBIS','ASTS','KORU','RKLB','BEAT','UB','BZ','SAGA','HEMI',
+    'XAU','XAG','XAUT','PAXG','OIL','GOLD','SILVER',
+}
 
-def is_weekend_blackout():
-    if not WEEKEND_BLACKOUT: return False
-    now = datetime.utcnow()
-    overflow = (now.hour + 7) >= 24
-    wd = (now.weekday() + (1 if overflow else 0)) % 7
-    hh = (now.hour + 7) % 24
-    if wd == 4 and hh >= 20: return True
-    if wd in (5, 6):          return True
-    if wd == 0 and hh < 9:   return True
-    return False
 
-def compute_rvol(ticker):
-    vol  = float(ticker.get('quoteVolume') or 0)
-    chg  = abs(float(ticker.get('percentage') or ticker.get('change') or 0))
-    last = float(ticker.get('last') or 1e-9)
-    return (vol * max(chg, 0.1)) / last
-
-# ── SMC DETECTORS ─────────────────────────────────────────────
-def detect_fvg_simple(df, lookback=20):
-    if len(df) < 5: return False, False
-    atr = calc_atr(df).iloc[-1]
-    if atr == 0: return False, False
-    min_size = atr * 0.3
-    for i in range(2, min(lookback+1, len(df))):
-        gap_top = df['low'].iloc[i-2]
-        gap_bot = df['low'].iloc[i]
-        if gap_top > gap_bot and (gap_top - gap_bot) >= min_size:
-            mid = df['close'].iloc[i-1]
-            if not (mid <= gap_top and mid >= gap_bot): return True, False
-        gap_top2 = df['high'].iloc[i]
-        gap_bot2 = df['high'].iloc[i-2]
-        if gap_top2 < gap_bot2 and (gap_bot2 - gap_top2) >= min_size:
-            mid = df['close'].iloc[i-1]
-            if not (mid >= gap_top2 and mid <= gap_bot2): return False, True
-    return False, False
-
-def detect_ob_simple(df, lookback=10):
-    if len(df) < 5: return False, False
-    atr = calc_atr(df).iloc[-1]
-    if atr == 0: return False, False
-    vol_avg = df['volume'].rolling(20).mean().iloc[-1]
-    if vol_avg == 0: return False, False
-    for i in range(1, min(lookback+1, len(df)-1)):
-        imp    = abs(df['close'].iloc[i-1] - df['close'].iloc[i])
-        vol_ok = df['volume'].iloc[i-1] > vol_avg * 1.5
-        if imp > atr * 2.0 and vol_ok:
-            if df['open'].iloc[i] > df['close'].iloc[i] and df['close'].iloc[i-1] > df['open'].iloc[i-1]:
-                if df['close'].iloc[-1] > df['open'].iloc[i]: return True, False
-            if df['open'].iloc[i] < df['close'].iloc[i] and df['close'].iloc[i-1] < df['open'].iloc[i-1]:
-                if df['close'].iloc[-1] < df['open'].iloc[i]: return False, True
-    return False, False
-
-# ── DATA PIPELINE ─────────────────────────────────────────────
-async def fetch_ohlcv_gate(session, symbol, tf, limit):
-    """Gate.io v4 futures USDT kline — terbukti tidak diblokir GitHub Actions."""
-    # Gate.io symbol format: BTC_USDT (underscore, bukan slash)
-    gate_sym = symbol.replace('/USDT:USDT', '').replace('/', '') + '_USDT'
-    interval = GATE_TF_MAP.get(tf, '15m')
-    params   = {"contract": gate_sym, "interval": interval, "limit": str(limit)}
-    for attempt in range(MAX_RETRIES):
+async def _get(s, url, p=None, lbl=""):
+    for a in range(RETRIES):
         try:
-            async with session.get(GATE_KLINE_URL, params=params,
-                                   timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status == 200:
-                    rows = await resp.json()
-                    if rows and len(rows) >= CANDLES_REQUIRED:
-                        df = pd.DataFrame(rows)
-                        # Gate.io v4 kline fields: t=timestamp, o=open, h=high, l=low, c=close, v=volume
-                        df = df.rename(columns={'t': 'timestamp', 'o': 'open', 'h': 'high',
-                                                'l': 'low', 'c': 'close', 'v': 'volume'})
-                        for col in ['open', 'high', 'low', 'close', 'volume']:
-                            df[col] = pd.to_numeric(df[col], errors='coerce')
-                        return df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
-        except Exception:
-            if attempt < MAX_RETRIES - 1:
-                await asyncio.sleep(RETRY_DELAY)
+            async with s.get(url, params=p, timeout=aiohttp.ClientTimeout(total=TMO)) as r:
+                if r.status == 200:
+                    return await r.json()
+                if r.status in (403, 451):
+                    logging.warning(f"HTTP {r.status} dari {lbl} - geo-block.")
+                    return None
+                if r.status == 429:
+                    await asyncio.sleep(DELAY * 2); continue
+        except Exception as e:
+            logging.debug(f"err {lbl}: {e}")
+        if a < RETRIES - 1:
+            await asyncio.sleep(DELAY)
     return None
 
-async def fetch_ohlcv_bybit(session, symbol, tf, limit):
-    """Bybit kline — fallback jika Gate.io gagal."""
-    bybit_sym = symbol.replace('/USDT:USDT', '').replace('/', '').upper() + 'USDT'
-    interval  = BYBIT_TF_MAP.get(tf, '15')
-    params    = {"category": "linear", "symbol": bybit_sym,
-                 "interval": interval, "limit": str(limit)}
-    for attempt in range(MAX_RETRIES):
-        try:
-            async with session.get(BYBIT_KLINE_URL, params=params,
-                                   timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    rows = data.get('result', {}).get('list', [])
-                    if rows and len(rows) >= CANDLES_REQUIRED:
-                        rows = list(reversed(rows))
-                        df = pd.DataFrame(rows,
-                            columns=['timestamp','open','high','low','close','volume','turnover'])
-                        for col in ['open','high','low','close','volume']:
-                            df[col] = pd.to_numeric(df[col], errors='coerce')
-                        return df[['timestamp','open','high','low','close','volume']]
-        except Exception:
-            if attempt < MAX_RETRIES - 1:
-                await asyncio.sleep(RETRY_DELAY)
-    return None
 
-async def fetch_ohlcv_safe(session, symbol, tf, limit):
-    """Bybit kline primary (confirmed working from GitHub Actions IP),
-       Gate.io kline fallback."""
-    df = await fetch_ohlcv_bybit(session, symbol, tf, limit)
-    if df is not None:
-        return df
-    return await fetch_ohlcv_gate(session, symbol, tf, limit)
-
-def build_indicators(df):
-    c, h, l, v = df['close'], df['high'], df['low'], df['volume']
-    atr = calc_atr(df)
-    rng = h - l
-    nd  = pd.Series(np.where(rng==0, 0, ((c-l)-(h-c))/rng*v), index=df.index)
-    ad  = nd.abs().rolling(20).mean()
-    sf  = np.clip((nd / np.where(ad==0, 1, ad)) * 20, -40, 40)
-    rsi = calc_rsi(c)
-    ps  = sf + np.clip((rsi-50)*1.2, -30, 30)
-    sw  = calc_swing_levels(df)
-    vm  = v.rolling(20).mean().iloc[-1]
-    vs  = v.rolling(20).std().iloc[-1]
-    z   = float((v.iloc[-1]-vm) / (vs if vs != 0 else 1))
-    true_rvol = round(float(v.iloc[-1] / max(vm, 1e-9)), 2)
-    return {
-        'close':        float(c.iloc[-1]),
-        'power_score':  round(float(ps.iloc[-1]), 1),
-        'rsi':          round(float(rsi.iloc[-1]), 1),
-        'atr':          round(float(atr.iloc[-1]), 6),
-        'is_squeezing': bool(calc_squeeze(df, atr).iloc[-1]),
-        'swing_high':   round(sw['swing_high'], 6),
-        'swing_low':    round(sw['swing_low'],  6),
-        'z_score':      round(z, 2),
-        'macd_hist':    float(calc_macd(c)[2].iloc[-1]),
-        'ema_f':        float(calc_ema(c, EMA_FAST).iloc[-1]),
-        'ema_s':        float(calc_ema(c, EMA_SLOW).iloc[-1]),
-        'adx':          calc_adx(df),
-        'true_rvol':    true_rvol,
-        '_df':          df
-    }
-
-async def phase1_scan(session, coin):
-    df = await fetch_ohlcv_safe(session, coin['symbol'], '15m', CANDLES_REQUIRED)
-    if df is None:
-        return None
-    i = build_indicators(df)
-    return {
-        'symbol':         coin['symbol'],
-        'Symbol':         coin['symbol'].split(':')[0],
-        'Price':          i['close'],
-        'power_15m':      i['power_score'],
-        'RSI_15m':        i['rsi'],
-        'ATR_15m':        i['atr'],
-        'Squeeze_15m':    i['is_squeezing'],
-        'Swing_High_15m': i['swing_high'],
-        'Swing_Low_15m':  i['swing_low'],
-        'ADX_15m':        i['adx'],
-        'rvol_score':     coin.get('_rvol', 0.0),
-        '_df_15m':        i['_df']
-    }
-
-async def phase2_enrich(session, c):
-    await asyncio.sleep(PHASE2_DELAY)
-    df_1h, df_5m = await asyncio.gather(
-        fetch_ohlcv_safe(session, c['symbol'], '1h', CANDLES_REQUIRED),
-        fetch_ohlcv_safe(session, c['symbol'], '5m', CANDLES_REQUIRED)
-    )
-    if df_1h is not None:
-        i1    = build_indicators(df_1h)
-        p     = i1['close']
-        trend = ("UPTREND"   if p > i1['ema_f'] > i1['ema_s'] else
-                 "DOWNTREND" if p < i1['ema_f'] < i1['ema_s'] else "RANGING")
-        c.update({
-            'Trend_1h':  trend, 'power_1h': i1['power_score'], 'ADX_1h': i1['adx'],
-            'rvol_score': i1['true_rvol'], 'True_RVOL': i1['true_rvol'],
-            '_close_1h': df_1h['close'].values[-CORR_WINDOW:].tolist(), '_df_1h': i1['_df']
-        })
-    else:
-        c.update({'Trend_1h': 'N/A', 'power_1h': c['power_15m'], 'ADX_1h': 0.0,
-                  'True_RVOL': c.get('rvol_score', 0.0), '_close_1h': [], '_df_1h': None})
-    if df_5m is not None:
-        i5  = build_indicators(df_5m)
-        z   = i5['z_score']
-        sqz = i5['is_squeezing']
-        sm_sig = ("💥NUC+SQZ" if z > 3.0 and sqz else "🐳NUCLEAR" if z > 3.0 else
-                  "🔥SQUEEZE" if sqz else "👀ACTIVE" if z > 1.5 else "😴QUIET")
-        c.update({'z_score_5m': z, 'SM_Signal': sm_sig, 'power_5m': i5['power_score']})
-    else:
-        c.update({'z_score_5m': 0.0, 'SM_Signal': '😴QUIET', 'power_5m': c['power_15m']})
-    return c
-
-def finalize_screener(c):
-    p15 = c['power_15m']
-    p1h = c.get('power_1h', p15)
-    p5m = c.get('power_5m', p15)
-    comp = (p1h * 0.40) + (p15 * 0.40) + (p5m * 0.20)
-    trend  = c.get('Trend_1h', 'RANGING')
-    td_dir = 1 if trend == 'UPTREND' else -1 if trend == 'DOWNTREND' else 0
-    if td_dir != 0 and (1 if p15 > 0 else -1) != td_dir: comp -= 15
-    sm_lvl    = c.get('SM_Signal', '😴QUIET')
-    is_nuclear = 'NUC' in sm_lvl
-    sm_bonus  = (23 if 'NUC+SQZ' in sm_lvl else 15 if is_nuclear else
-                  7 if 'ACTIVE' in sm_lvl else 0)
-    if sm_bonus > 0: comp += sm_bonus if comp > 0 else -sm_bonus
-    # FIX: parenthesis benar (versi AI lain missing closing paren)
-    aligned = ((p5m > 0 and p15 > 0 and p1h > 0) or (p5m < 0 and p15 < 0 and p1h < 0))
-    if aligned: comp += 5 if comp > 0 else -5
-    adx_val  = max(c.get('ADX_1h', 0.0), c.get('ADX_15m', 0.0))
-    is_side  = adx_val < (ADX_MIN_NUCLEAR if is_nuclear else ADX_MIN_NORMAL) and not is_nuclear
-    is_cancel = ((trend == 'DOWNTREND' and comp > 0) or
-                 (trend == 'UPTREND' and comp < 0) or is_side)
-    c.update({
-        'Composite':   round(comp, 1), 'Aligned': aligned, 'ADX': adx_val,
-        'Sideways':    is_side, 'Is_Cancel': is_cancel,
-        'Matrix_Sync': ("FULL BULL" if comp >= 40 else "BULLISH" if comp > 10 else
-                        "FULL BEAR" if comp <= -40 else "BEARISH" if comp < -10 else "NEUTRAL")
-    })
-    is_long = comp > 0
-    _df_1h  = c.get('_df_1h')
-    _df_15m = c.get('_df_15m')
-    df_smc  = None
-    if _df_1h is not None and not _df_1h.empty:    df_smc = _df_1h
-    elif _df_15m is not None and not _df_15m.empty: df_smc = _df_15m
-    has_fvg_bull, has_fvg_bear = (detect_fvg_simple(df_smc) if df_smc is not None else (False, False))
-    has_ob_bull,  has_ob_bear  = (detect_ob_simple(df_smc)  if df_smc is not None else (False, False))
-    has_fvg = (has_fvg_bull and is_long) or (has_fvg_bear and not is_long)
-    has_ob  = (has_ob_bull  and is_long) or (has_ob_bear  and not is_long)
-    conv = 0
-    if has_fvg:          conv += 20
-    if aligned:          conv += 12
-    if is_nuclear:       conv += 15
-    if adx_val > 25:     conv += 10
-    elif adx_val < 18:   conv -= 30
-    if c['Squeeze_15m']: conv += 8
-    if has_ob:           conv += 8
-    conv = max(0, min(100, conv))
-    c['Conviction'] = conv
-    c['Checklist']  = (int(has_fvg) + int(aligned) + int(not is_side) +
-                       int(conv >= CONV_VALID) + int(has_ob))
-    if is_cancel or conv < 40:                      c['Tier'] = "REJECT"
-    elif conv >= CONV_INST and c['Checklist'] >= 4:  c['Tier'] = "INSTITUTIONAL"
-    elif conv >= CONV_VALID and c['Checklist'] >= 3: c['Tier'] = "VALID"
-    elif conv >= 40:                                 c['Tier'] = "WEAK"
-    else:                                            c['Tier'] = "REJECT"
-    return c
-
-def filter_by_correlation(candidates):
-    if len(candidates) <= 1: return candidates
-    kept, series = [], {}
-    for c in candidates:
-        closes = c.get('_close_1h', [])
-        if len(closes) >= 10: series[c['symbol']] = np.array(closes[-CORR_WINDOW:], dtype=float)
-    for c in candidates:
-        sym, too_corr = c['symbol'], False
-        if sym in series:
-            for k in kept:
-                if k['symbol'] not in series: continue
-                s1, s2 = series[sym], series[k['symbol']]
-                n = min(len(s1), len(s2))
-                if n >= 10:
-                    corr = float(np.corrcoef(s1[-n:], s2[-n:])[0, 1])
-                    if not np.isnan(corr) and corr > CORR_THRESHOLD:
-                        too_corr = True; break
-        if not too_corr: kept.append(c)
-        if len(kept) >= 8: break
-    return kept
-
-async def get_screener_data():
-    # HYBRID ANTI-BLOKIR:
-    # 1. Gate.io v4 API → tickers futures USDT (tidak pernah blokir GitHub IP)
-    # 2. Gate.io v4 API → OHLCV kline (primary)
-    # 3. Bybit kline → OHLCV fallback jika Gate.io gagal per-coin
-    logging.info("Mengambil tickers dari Gate.io v4...")
+def load_bybit_symbols_local():
     try:
-        async with aiohttp.ClientSession() as session:
-            # Gate.io v4 futures tickers
-            async with session.get(GATE_TICKER_URL,
-                                   timeout=aiohttp.ClientTimeout(total=20)) as resp:
-                if resp.status != 200:
-                    raise Exception(f"Gate.io HTTP {resp.status}")
-                data = await resp.json()
+        with open(BYBIT_SYMBOLS_FILE) as f:
+            data = json.load(f)
+        syms = set(data.get('symbols', []))
+        if syms:
+            logging.info(f"Bybit: {len(syms)} simbol dari file lokal "
+                         f"(update: {data.get('updated_at', '?')})")
+            return syms
+    except FileNotFoundError:
+        logging.warning(f"{BYBIT_SYMBOLS_FILE} tidak ditemukan.")
+    except (json.JSONDecodeError, KeyError) as e:
+        logging.warning(f"{BYBIT_SYMBOLS_FILE} rusak: {e}")
+    return None
 
-        if not data:
-            raise Exception("Empty ticker list dari Gate.io")
 
-        all_tickers = []
-        for item in data:
-            contract = item.get('contract', '')
-            if not contract.endswith('_USDT'):
-                continue
-            base = contract.replace('_USDT', '')
-            vol  = float(item.get('volume_24h_quote', 0) or item.get('volume_24h', 0) or 0)
-            last = float(item.get('last', 0) or 0)
-            chg  = abs(float(item.get('change_percentage', 0) or 0))
-            if vol <= 0 or last <= 0:
-                continue
-            rvol_score = (vol * max(chg, 0.1)) / max(last, 1e-9)
-            all_tickers.append({
-                'symbol':      f"{base}/USDT:USDT",
-                'last':        last,
-                'quoteVolume': vol,
-                'percentage':  chg,
-                '_rvol':       rvol_score
-            })
+async def bybit_syms(s):
+    local = load_bybit_symbols_local()
+    if local:
+        return local
+    d = await _get(s, f"{BYBIT}/instruments-info",
+                   {"category": "linear", "limit": 1000}, "Bybit instruments-info")
+    if not d or d.get('retCode') != 0:
+        logging.warning("Simbol Bybit tak terambil - filter Bybit NONAKTIF.")
+        return None
+    return {i['symbol'] for i in d.get('result', {}).get('list', [])
+            if i.get('symbol', '').endswith('USDT') and i.get('status') == 'Trading'}
 
-        all_vols        = [t['quoteVolume'] for t in all_tickers if t['quoteVolume'] > 0]
-        dynamic_min_vol = (max(5_000_000, np.percentile(all_vols, 70) * 0.5)
-                           if all_vols else 7_000_000)
-        # Major coins whitelist — selalu masuk universe terlepas dari rvol
-        MAJOR = {"BTC","ETH","SOL","BNB","XRP","ADA","AVAX","DOGE","LINK","DOT",
-                 "UNI","LTC","BCH","ATOM","XLM","ETC","NEAR","APT","ARB","OP",
-                 "INJ","SUI","TIA","HYPE","AAVE","TAO","ENA","LDO","ORDI","WIF"}
 
-        liquid = [t for t in all_tickers
-                  if t['quoteVolume'] >= dynamic_min_vol and t['last'] > 0]
+async def on_bybit(s, sym):
+    """Cek tradable di Bybit lewat kline - satu-satunya endpoint Bybit yang
+    lolos geo-block dari GitHub Actions."""
+    d = await _get(s, f"{BYBIT}/kline",
+                   {"category": "linear", "symbol": sym, "interval": "60", "limit": 1},
+                   f"Bybit kline {sym}")
+    if not d or d.get('retCode') != 0:
+        return False
+    return bool(d.get('result', {}).get('list'))
 
-        # Pisah: major coins vs others
-        majors = [t for t in liquid if t['symbol'].split('/')[0] in MAJOR]
-        others = [t for t in liquid if t['symbol'].split('/')[0] not in MAJOR]
 
-        # Major coins masuk semua, others diranking by rvol untuk sisa slot
-        others_sorted = sorted(others, key=lambda x: x['_rvol'], reverse=True)
-        combined = majors + others_sorted
-        top = combined[:TOP_COINS_BY_RVOL]
-        logging.info(f"Universe: {len(majors)} major + {len(others_sorted)} others → Top {len(top)}")
-
-        logging.info(f"Gate.io: {len(all_tickers)} contracts → Top {len(top)} liquid. Fetch OHLCV...")
-
-        async with aiohttp.ClientSession() as session:
-            # Phase 1
-            sem1 = asyncio.Semaphore(SEMAPHORE_P1)
-            async def sp1(coin):
-                async with sem1: return await phase1_scan(session, coin)
-            p1    = await asyncio.gather(*[sp1(c) for c in top])
-            cands = sorted([r for r in p1 if r],
-                           key=lambda x: abs(x['power_15m']), reverse=True)[:RANKED_CANDIDATES]
-
-            if not cands:
-                logging.warning("Tidak ada candle berhasil di-fetch.")
-                return []
-
-            # Phase 2
-            sem2 = asyncio.Semaphore(SEMAPHORE_P2)
-            async def sp2(c):
-                async with sem2: return await phase2_enrich(session, c)
-            enriched  = await asyncio.gather(*[sp2(c) for c in cands])
-
-        finalized = sorted([finalize_screener(c) for c in enriched],
-                           key=lambda x: x['Conviction'], reverse=True)
-        # Log conviction stats untuk monitoring
-        convs = [c['Conviction'] for c in finalized]
-        tiers = [c['Tier'] for c in finalized]
-        logging.info(f"Conviction scores: {convs}")
-        logging.info(f"Tiers: {tiers}")
-        return filter_by_correlation(finalized)
-
-    except Exception as e:
-        logging.error(f"Gagal fetch data: {e}")
+async def universe(s, bsyms):
+    d = await _get(s, f"{GATE}/tickers", lbl="Gate tickers")
+    if not d:
         return []
+    out, skip, skip_nc = [], 0, 0
+    for i in d:
+        c = i.get('contract', '')
+        if not c.endswith('_USDT'):
+            continue
+        base = c.replace('_USDT', '')
+        if base in NON_CRYPTO:
+            skip_nc += 1; continue
+        bs = c.replace('_', '')
+        if bsyms is not None and bs not in bsyms:
+            skip += 1; continue
+        try:
+            tv = float(i.get('volume_24h_quote') or 0)
+            lp = float(i.get('last') or 0)
+            fr = float(i.get('funding_rate') or 0)
+        except (TypeError, ValueError):
+            continue
+        if tv < MIN_TURNOVER or lp <= 0:
+            continue
+        out.append({'c': c, 'sym': bs, 'tv': tv, 'fr': fr})
+    out.sort(key=lambda x: x['tv'], reverse=True)
+    out = out[:MAX_SYM]
+    logging.info(f"Universe: {len(out)} pair (tak ada di Bybit: {skip}, "
+                 f"non-crypto: {skip_nc})")
+    return out
 
-# ── TELEGRAM ──────────────────────────────────────────────────
-def build_screener_message(data_list):
-    valid_coins = [d for d in data_list if d['Tier'] != "REJECT"]
-    if not valid_coins:
-        return ("😴 *SCREENER RESULTS*\n"
-                "Semua koin filter out (Sideways/Counter-trend).\n"
-                "Market sedang tidak bersahabat untuk intraday.")
-    msg = ("🔬 *SCREENER RESULTS (Buka chart & cocokkan Pine v7.1)*\n"
-           "Prioritaskan koin berlabel INST/VALID dengan Conviction tinggi.\n\n")
-    for i, d in enumerate(valid_coins[:5], 1):
-        direction  = "🟢 LONG"  if d['Composite'] > 0 else "🔴 SHORT"
-        aln_badge  = "✅3TF"    if d['Aligned']        else "⚡2TF"
-        rvol       = d.get('True_RVOL', 0)
-        rvol_badge = f" 📈{rvol:.1f}x" if rvol >= 1.5 else ""
-        tier       = d['Tier']
-        tier_emoji = "💎" if tier == "INSTITUTIONAL" else "✅" if tier == "VALID" else "⚠️"
-        tier_text  = (f"{tier_emoji} *[{tier}]*"
-                      if tier in ("INSTITUTIONAL", "VALID") else f"{tier_emoji} {tier}")
-        msg += (f"{i}. {d['Symbol']} — {direction} `{d['Matrix_Sync']}` {tier_text}\n"
-                f"   🧠 Conviction: `{d['Conviction']}/100` | Checklist: `{d['Checklist']}/7`\n"
-                f"   SM: {d['SM_Signal']} | ADX: `{d['ADX']}` {aln_badge}{rvol_badge}\n\n")
-    return msg
 
-async def send_telegram(text):
-    if not all([TG_TOKEN, TG_CHAT_ID]): return
-    url    = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
-    async with aiohttp.ClientSession() as session:
-        for chunk in chunks:
-            payload = {"chat_id": TG_CHAT_ID, "text": chunk, "parse_mode": "Markdown"}
+def _f(d, *ks):
+    for k in ks:
+        v = d.get(k)
+        if v is not None:
             try:
-                async with session.post(url, json=payload,
-                                        timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    if resp.status == 400:
-                        payload.pop("parse_mode", None)
-                        await session.post(url, json=payload)
-            except Exception as e:
-                logging.error(f"TG Error: {e}")
+                return float(v)
+            except (TypeError, ValueError):
+                pass
+    return None
 
-# ── MAIN ──────────────────────────────────────────────────────
+
+async def oi_series(s, c):
+    """Satu seri 15m -> perubahan OI dengan lookback 1/4/16 bar (=15m/1h/4h).
+    Dihitung sendiri karena agregasi per-interval Gate menghasilkan nilai
+    IDENTIK antara 1h dan 4h (terbukti 14 Sep 2026)."""
+    d = await _get(s, f"{GATE}/contract_stats",
+                   {"contract": c, "interval": "15m", "limit": 20},
+                   "Gate contract_stats")
+    if not d or not isinstance(d, list) or len(d) < 17:
+        return {}, None
+    try:
+        d = sorted(d, key=lambda x: x.get('time', 0))
+    except Exception:
+        pass
+    oi = [_f(x, 'open_interest_usd', 'open_interest') for x in d]
+    if any(v is None for v in oi[-17:]):
+        return {}, None
+
+    def chg(lb):
+        base = oi[-1 - lb]
+        return ((oi[-1] - base) / base * 100.0) if base and base > 0 else None
+
+    out = {lb: chg(n) for lb, _, n in TFS}
+    return out, _f(d[-1], 'lsr_account')
+
+
+async def px_change(s, c, iv):
+    """% perubahan harga candle TERTUTUP terakhir (candle berjalan dibuang)."""
+    d = await _get(s, f"{GATE}/candlesticks",
+                   {"contract": c, "interval": iv, "limit": 6}, "Gate candles")
+    if not d or not isinstance(d, list) or len(d) < 3:
+        return None
+    try:
+        d = sorted(d, key=lambda x: int(x.get('t', 0)))
+        cl = [float(r['c']) for r in d]
+    except (KeyError, TypeError, ValueError):
+        return None
+    if cl[-3] <= 0:
+        return None
+    return (cl[-2] - cl[-3]) / cl[-3] * 100.0
+
+
+QUAD = {
+    ( True,  True): ('LONG_BUILDUP',   '🟢 LONG BUILDUP',   'Px↑ OI↑'),
+    (False,  True): ('SHORT_BUILDUP',  '🔴 SHORT BUILDUP',  'Px↓ OI↑'),
+    ( True, False): ('SHORT_COVERING', '🔵 SHORT COVERING', 'Px↑ OI↓'),
+    (False, False): ('LONG_UNWINDING', '🟠 LONG UNWINDING', 'Px↓ OI↓'),
+}
+
+
+def fstate(fr):
+    if fr is None: return 'UNKNOWN', ''
+    if fr >= FUND_VEXT:  return 'LONG_VCROWD',  'long sangat ramai'
+    if fr >= FUND_EXT:   return 'LONG_CROWD',   'long ramai'
+    if fr <= -FUND_VEXT: return 'SHORT_VCROWD', 'short sangat ramai'
+    if fr <= -FUND_EXT:  return 'SHORT_CROWD',  'short ramai'
+    return 'BALANCED', ''
+
+
+async def screen(s, it, sem, st):
+    """Lolos HANYA jika ketiga TF menunjukkan arah harga DAN arah OI yang sama."""
+    c = it['c']
+    async with sem:
+        oimap, lsr = await oi_series(s, c)
+        if not oimap:
+            st['no_oi'] += 1
+            return None
+        pxmap = {}
+        for lb, iv, _ in TFS:
+            pxmap[lb] = await px_change(s, c, iv)
+
+    if any(pxmap.get(lb) is None or oimap.get(lb) is None for lb, _, _ in TFS):
+        st['data_kurang'] += 1
+        return None
+
+    # Semua TF harus melewati ambang minimum (bukan gerakan nyaris-nol)
+    if any(abs(pxmap[lb]) < MIN_MOVE[lb] or abs(oimap[lb]) < MIN_MOVE[lb]
+           for lb, _, _ in TFS):
+        st['terlalu_kecil'] += 1
+        return None
+
+    px_up = [pxmap[lb] > 0 for lb, _, _ in TFS]
+    oi_up = [oimap[lb] > 0 for lb, _, _ in TFS]
+
+    # SYARAT INTI: ketiga TF sepakat, untuk harga maupun OI
+    if len(set(px_up)) != 1 or len(set(oi_up)) != 1:
+        st['tf_tak_sepakat'] += 1
+        return None
+
+    st['lolos'] += 1
+    key, label, pola = QUAD[(px_up[0], oi_up[0])]
+
+    fr = it['fr']
+    fs, fnote = fstate(fr)
+    lsr_note = ''
+    if lsr is not None:
+        if lsr >= LSR_HI:   lsr_note = 'akun mayoritas long'
+        elif lsr <= LSR_LO: lsr_note = 'akun mayoritas short'
+
+    # SQUEEZE: buildup yang sisi ramainya SEARAH posisi itu sendiri -> rapuh
+    sq = ((key == 'LONG_BUILDUP'  and (fs in ('LONG_CROWD', 'LONG_VCROWD')
+                                       or (lsr is not None and lsr >= LSR_HI))) or
+          (key == 'SHORT_BUILDUP' and (fs in ('SHORT_CROWD', 'SHORT_VCROWD')
+                                       or (lsr is not None and lsr <= LSR_LO))))
+
+    # Urutan = kekuatan OI rata-rata lintas TF. Transparan, bukan bobot karangan.
+    strength = float(np.mean([abs(oimap[lb]) for lb, _, _ in TFS]))
+
+    return {'sym': it['sym'], 'key': key, 'sq': sq, 'strength': strength,
+            'px': pxmap, 'oi': oimap, 'fr': fr, 'fnote': fnote,
+            'lsr': lsr, 'lsr_note': lsr_note, 'tv': it['tv']}
+
+
+HL_API = "https://api.hyperliquid.xyz/info"
+VOL_SAMPLE = 12      # berapa koin dipakai menghitung baseline volume
+VOL_DAYS   = 8       # 1 hari berjalan + 7 hari pembanding
+
+
+async def _hl_context(s):
+    """Hyperliquid metaAndAssetCtxs - SATU panggilan POST untuk seluruh
+    universe perp (~224 koin). Gratis, tanpa API key. Dipakai sebagai
+    pembanding lintas-bursa karena Gate.io saja bisa bias (contoh: XLM
+    tercatat tipis di Gate padahal likuid secara global).
+
+    Hyperliquid adalah DEX, jadi kemungkinan tidak kena geo-block seperti
+    Bybit. Kalau gagal, fungsi ini mengembalikan None dan sisanya tetap jalan.
+    """
+    try:
+        async with s.post(HL_API, json={"type": "metaAndAssetCtxs"},
+                          timeout=aiohttp.ClientTimeout(total=TMO)) as r:
+            if r.status != 200:
+                logging.warning(f"Hyperliquid HTTP {r.status}")
+                return None
+            data = await r.json()
+    except Exception as e:
+        logging.warning(f"Hyperliquid gagal: {e}")
+        return None
+
+    if not isinstance(data, list) or len(data) < 2:
+        return None
+    ctxs = data[1]
+    if not isinstance(ctxs, list):
+        return None
+
+    vol = oi = 0.0
+    up = down = 0
+    for c in ctxs:
+        try:
+            v = float(c.get('dayNtlVlm') or 0)
+            o = float(c.get('openInterest') or 0)
+            mk = float(c.get('markPx') or 0)
+            pv = float(c.get('prevDayPx') or 0)
+        except (TypeError, ValueError):
+            continue
+        vol += v
+        oi += o * mk
+        if pv > 0 and mk > 0:
+            if mk > pv:   up += 1
+            elif mk < pv: down += 1
+    return {'vol': vol, 'oi': oi, 'up': up, 'down': down, 'n': len(ctxs)}
+
+
+async def _vol_baseline(s, uni):
+    """Volume hari ini vs rata-rata 7 hari sebelumnya, dari candle 1d.
+
+    Menjawab 'sepi atau ramai' TANPA perlu menyimpan data antar-run:
+    baseline-nya diambil ulang tiap kali dari candle harian. Memakai
+    sampel koin tervolume terbesar agar hemat panggilan API.
+    """
+    today = prev = 0.0
+    ok = 0
+    for it in uni[:VOL_SAMPLE]:
+        d = await _get(s, f"{GATE}/candlesticks",
+                       {"contract": it['c'], "interval": "1d",
+                        "limit": VOL_DAYS}, "Gate 1d")
+        if not d or not isinstance(d, list) or len(d) < 3:
+            continue
+        try:
+            d = sorted(d, key=lambda x: int(x.get('t', 0)))
+            vols = [float(x.get('sum') or x.get('v') or 0) for x in d]
+        except (TypeError, ValueError):
+            continue
+        if len(vols) < 3:
+            continue
+        today += vols[-1]
+        prev += float(np.mean(vols[:-1]))   # rata-rata hari-hari sebelumnya
+        ok += 1
+    if ok == 0 or prev <= 0:
+        return None
+    return today / prev
+
+
+# ============================================================
+# REGIME ALIGNMENT — ditambahkan
+# ============================================================
+
+def compute_regime_score(gate_pct_up, hl_pct_up=None):
+    """Skor alignment [-1, +1] dari breadth (% pair naik) dua sumber.
+
+    +1.0 = seluruhnya naik & dua sumber sepakat penuh
+    -1.0 = seluruhnya turun & dua sumber sepakat penuh
+     0.0 = 50/50 (choppy) ATAU dua sumber saling bertentangan arah
+
+    Kalau Hyperliquid gagal diambil (hl_pct_up=None), fallback ke Gate saja
+    tapi skor didiskon 30% -- konfirmasi silang tidak tersedia, jadi confidence
+    diturunkan alih-alih dianggap sama kuatnya dengan skor 2-sumber.
+    Return (skor, has_cross_confirm).
+    """
+    gate_score = (gate_pct_up - 50.0) / 50.0  # -1..+1
+
+    if hl_pct_up is None:
+        return round(gate_score * 0.7, 3), False
+
+    hl_score = (hl_pct_up - 50.0) / 50.0
+    agree = (gate_score > 0) == (hl_score > 0) or (abs(gate_score) < 0.05 and abs(hl_score) < 0.05)
+
+    if not agree:
+        # Dua sumber bertentangan arah -> SINYAL "tidak jelas", ditarik ke nol
+        # (bukan dirata-ratakan naif, yang akan menyembunyikan konfliknya).
+        return 0.0, False
+
+    return round((gate_score + hl_score) / 2, 3), True
+
+
+def classify_regime(score, has_cross_confirm):
+    """Label + rekomendasi durasi hold, sesuai gradien WR yang terbukti di data historis."""
+    if score >= ALIGN_STRONG:
+        label, emoji = "SEARAH KUAT", "🟢"
+        advice = "Alignment kuat -- riwayat: layak ditahan sebagai swing (>24 jam) bila entry valid."
+    elif score <= ALIGN_WEAK:
+        label, emoji = "LAWAN KUAT", "🔴"
+        advice = "Melawan tren kuat -- riwayat WR rendah. Pertimbangkan skip atau size kecil."
+    elif -0.10 <= score <= 0.10:
+        label, emoji = "CHOPPY", "⚪"
+        advice = "Tidak ada arah jelas. Riwayat: kombinasi lemah+ditahan lama = WR terendah (10%). Kalau entry, potong cepat, jangan swing."
+    else:
+        label, emoji = ("SEARAH LEMAH", "🟡") if score > 0 else ("LAWAN LEMAH", "🟠")
+        advice = "Sinyal ada tapi belum kuat. Riwayat: nyaris breakeven di kondisi ini -- selektif."
+
+    confirm_note = "" if has_cross_confirm else " (⚠️ tanpa konfirmasi silang Hyperliquid)"
+    return label, emoji, advice, confirm_note
+
+
+def load_prev_regime_state():
+    try:
+        with open(REGIME_STATE_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def save_regime_state(score, label):
+    state = {"score": score, "label": label,
+              "timestamp": datetime.now(timezone.utc).isoformat()}
+    with open(REGIME_STATE_FILE, "w") as f:
+        json.dump(state, f)
+
+
+def detect_reversal(current_score, prev_state):
+    """Reversal = skor ganti tanda (melewati nol) DAN pergerakannya cukup
+    besar (>=0.25) supaya bukan noise di sekitar nol."""
+    if prev_state is None:
+        return None
+    prev_score = prev_state.get("score", 0)
+    changed_sign = (current_score > 0.05 and prev_score < -0.05) or \
+                   (current_score < -0.05 and prev_score > 0.05)
+    if changed_sign and abs(current_score - prev_score) >= 0.25:
+        direction = "BULLISH → BEARISH" if current_score < prev_score else "BEARISH → BULLISH"
+        prev_time = prev_state.get("timestamp", "?")
+        hh_mm = prev_time[11:16] if len(prev_time) > 16 else prev_time
+        return f"⚡ REGIME BERBALIK: {direction} (dari cycle {hh_mm} UTC)"
+    return None
+
+
+def build_regime_section(gate_pct_up, hl_pct_up, weekend):
+    """Return string siap ditempel ke pesan Telegram YANG SAMA, di ATAS
+    daftar kuadran koin. Dipanggil dari build()."""
+    score, has_confirm = compute_regime_score(gate_pct_up, hl_pct_up)
+    label, emoji, advice, confirm_note = classify_regime(score, has_confirm)
+
+    prev_state = load_prev_regime_state()
+    reversal_msg = detect_reversal(score, prev_state)
+    save_regime_state(score, label)
+
+    lines = [
+        f"{emoji} <b>REGIME: {label}</b>{confirm_note}",
+        f"Skor alignment: {score:+.2f} (Gate {gate_pct_up:.0f}% naik"
+        + (f", Hyperliquid {hl_pct_up:.0f}% naik" if hl_pct_up is not None else "")
+        + ")",
+        f"<i>{advice}</i>",
+    ]
+    if reversal_msg:
+        lines.insert(0, reversal_msg)
+    if weekend:
+        lines.append("⚠️ Akhir pekan -- riwayat WR lebih rendah di hari ini, terlepas dari regime.")
+    return "\n".join(lines)
+
+
+async def market_context(s, uni):
+    """Rangkuman kondisi pasar. Regime section pakai breadth dari sini,
+    lalu deskriptif tambahan (volume, LSR) tetap seperti semula."""
+    d = await _get(s, f"{GATE}/tickers", lbl="Gate tickers (context)")
+    up = down = 0
+    total_vol = 0.0
+    if d:
+        for i in d:
+            c = i.get('contract', '')
+            if not c.endswith('_USDT') or c.replace('_USDT', '') in NON_CRYPTO:
+                continue
+            try:
+                chg = float(i.get('change_percentage') or 0)
+                vol = float(i.get('volume_24h_quote') or 0)
+            except (TypeError, ValueError):
+                continue
+            if vol < MIN_TURNOVER:
+                continue
+            total_vol += vol
+            if chg > 0:   up += 1
+            elif chg < 0: down += 1
+
+    n = up + down
+    if n == 0:
+        return None, None
+    pct_up = up / n * 100.0
+
+    ratio = await _vol_baseline(s, uni)
+    hl = await _hl_context(s)
+    hl_pct_up = None
+    if hl:
+        hl_n = hl['up'] + hl['down']
+        if hl_n > 0:
+            hl_pct_up = hl['up'] / hl_n * 100.0
+
+    lsrs = []
+    for it in uni[:10]:
+        try:
+            _, lsr = await oi_series(s, it['c'])
+            if lsr is not None:
+                lsrs.append(lsr)
+        except Exception:
+            pass
+    lsr_avg = float(np.mean(lsrs)) if lsrs else None
+
+    now = datetime.now(timezone.utc).astimezone()
+    weekend = now.weekday() >= 5
+
+    def money(v):
+        return f"${v/1e9:.1f}M" if v >= 1e9 else f"${v/1e6:.0f}jt"
+
+    # --- Regime alignment section (baru) ---
+    regime_section = build_regime_section(pct_up, hl_pct_up, weekend)
+
+    # --- Deskriptif tambahan (seperti semula) ---
+    if pct_up >= 60:   regime, emo = "BULLISH", "🟢"
+    elif pct_up <= 40: regime, emo = "BEARISH", "🔴"
+    else:              regime, emo = "NEUTRAL", "⚪"
+
+    lines = [f"{emo} <b>{regime}</b> · {pct_up:.0f}% naik ({up}↑/{down}↓)"]
+    vol_line = f"Vol Gate {money(total_vol)}"
+    if ratio is not None:
+        if ratio >= 1.3:   tag = "RAMAI"
+        elif ratio <= 0.7: tag = "SEPI"
+        else:              tag = "normal"
+        vol_line += f" · {ratio:.1f}x rata2 7hr ({tag})"
+    if weekend:
+        vol_line += " · ⚠️ akhir pekan"
+    lines.append(vol_line)
+
+    if hl:
+        hl_n = hl['up'] + hl['down']
+        hl_pct = (hl['up'] / hl_n * 100.0) if hl_n else 0
+        lines.append(f"Hyperliquid: vol {money(hl['vol'])} · OI {money(hl['oi'])} "
+                     f"· {hl_pct:.0f}% naik")
+
+    if lsr_avg is not None:
+        lines.append(f"L/S top-10: {lsr_avg:.2f} "
+                     f"(condong {'long' if lsr_avg > 1 else 'short'})")
+
+    ctx_descriptive = "\n".join(lines)
+    return regime_section, ctx_descriptive
+
+
+def fmt(r, i):
+    px, oi = r['px'], r['oi']
+    tv = r['tv']
+    tv_s = f"{tv/1e6:.0f}jt" if tv >= 1e6 else f"{tv/1e3:.0f}rb"
+    fr_s = f"{r['fr']*100:+.2f}%" if r['fr'] is not None else "n/a"
+
+    out = [f"<b>{i}. {r['sym']}</b>  ${tv_s}",
+           "   " + " · ".join(f"{lb} {px[lb]:+.1f}%" for lb, _, _ in TFS),
+           "   OI " + " · ".join(f"{oi[lb]:+.1f}%" for lb, _, _ in TFS),
+           f"   Funding {fr_s}"]
+
+    notes = [n for n in (r['fnote'], r['lsr_note']) if n]
+    if notes:
+        out[-1] += " — " + ", ".join(notes)
+    return "\n".join(out)
+
+
+def build(res, regime_section=None, ctx=None):
+    now = datetime.now(timezone.utc).astimezone()
+    sq = [r for r in res if r['sq']]
+    groups = []
+    for key in ('LONG_BUILDUP', 'SHORT_BUILDUP', 'SHORT_COVERING', 'LONG_UNWINDING'):
+        items = [r for r in res if r['key'] == key and not r['sq']]
+        if items:
+            _, label, pola = next(v for v in QUAD.values() if v[0] == key)
+            groups.append((items, label, pola))
+
+    p = [f"📡 <b>OI SCREENER</b> · {now.strftime('%d %b %H:%M')}"]
+
+    # Regime alignment DULU (paling atas, sebelum konteks deskriptif & kuadran)
+    if regime_section:
+        p.append(regime_section)
+        p.append("─" * 28)
+
+    if ctx:
+        p.append(ctx)
+    p.append("<i>syarat: 15m, 1h, 4h semua searah</i>")
+
+    for items, label, pola in groups:
+        p.append(f"\n<b>{label}</b> <i>{pola}</i>")
+        p += [fmt(r, i) for i, r in enumerate(items[:TOPN], 1)]
+
+    if sq:
+        p.append("\n<b>⚡ SQUEEZE WATCH</b> <i>buildup tapi sisinya kelewat ramai</i>")
+        p += [fmt(r, i) for i, r in enumerate(sq[:TOPN], 1)]
+
+    if not res:
+        p.append("\nTidak ada kandidat.")
+    return "\n".join(p)
+
+
+async def send(s, txt):
+    if not TG_TOKEN or not TG_CHAT:
+        logging.warning("Secret Telegram kosong - cetak ke log.")
+        print("\n" + txt); return
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    ch, cur = [], ""
+    for ln in txt.split("\n"):
+        if len(cur) + len(ln) + 1 > 3800:
+            ch.append(cur); cur = ln
+        else:
+            cur = f"{cur}\n{ln}" if cur else ln
+    if cur:
+        ch.append(cur)
+    for c in ch:
+        try:
+            async with s.post(url, json={"chat_id": TG_CHAT, "text": c,
+                                         "parse_mode": "HTML",
+                                         "disable_web_page_preview": True},
+                              timeout=aiohttp.ClientTimeout(total=20)) as r:
+                if r.status != 200:
+                    logging.error(f"TG HTTP {r.status}: {await r.text()}")
+                else:
+                    logging.info("Pesan terkirim ke Telegram.")
+        except Exception as e:
+            logging.error(f"TG error: {e}")
+        await asyncio.sleep(0.4)
+
+
 async def main():
-    ts = datetime.now().strftime("%d %b %Y, %H:%M WIB")
-    if is_weekend_blackout():
-        await send_telegram(f"😴 *SCREENER BLACKOUT*\n🕐 {ts}\n⛔ Weekend — Bot istirahat.")
-        return
-    logging.info("🚀 Screener v7.1 dimulai...")
-    data = await get_screener_data()
-    if not data:
-        await send_telegram("⚠️ Gagal fetch data dari Gate.io & Bybit.")
-        return
-    n_inst  = sum(1 for d in data if d['Tier'] == "INSTITUTIONAL")
-    n_valid = sum(1 for d in data if d['Tier'] == "VALID")
-    header  = (f"👁️ *GOD MODE SCREENER v7.1*\n"
-               f"🕐 {ts} | Gate.io Ticker + Gate/Bybit Kline\n"
-               f"📊 Scanned: {len(data)} | 💎 INST: {n_inst} | ✅ VALID: {n_valid}\n"
-               f"{'─' * 35}\n\n")
-    await send_telegram(header + build_screener_message(data))
-    logging.info(f"✅ Selesai. {n_inst} INST, {n_valid} VALID.")
+    async with aiohttp.ClientSession(headers={'Accept': 'application/json'}) as s:
+        bs = await bybit_syms(s)
+        uni = await universe(s, bs)
+        if not uni:
+            logging.error("Universe kosong dari Gate.io.")
+            await send(s, "📡 <b>OI SCREENER</b>\n\n❌ Universe kosong. Cek log.")
+            return
+
+        sem = asyncio.Semaphore(SEM_N)
+        st = {'no_oi': 0, 'data_kurang': 0, 'terlalu_kecil': 0,
+              'tf_tak_sepakat': 0, 'lolos': 0}
+        raw = await asyncio.gather(*[screen(s, i, sem, st) for i in uni],
+                                   return_exceptions=True)
+
+        errs = [r for r in raw if isinstance(r, Exception)]
+        if errs:
+            from collections import Counter
+            for msg, n in Counter(f"{type(e).__name__}: {e}" for e in errs).most_common(3):
+                logging.error(f"TASK GAGAL x{n} -> {msg}")
+
+        res = [r for r in raw if r and not isinstance(r, Exception)]
+        res.sort(key=lambda x: x['strength'], reverse=True)
+
+        logging.info(
+            f"FUNNEL {len(uni)} pair -> tanpa OI:{st['no_oi']} | "
+            f"data kurang:{st['data_kurang']} | gerakan terlalu kecil:"
+            f"{st['terlalu_kecil']} | TF tak sepakat:{st['tf_tak_sepakat']} | "
+            f"LOLOS:{st['lolos']}")
+
+        regime_section, ctx = await market_context(s, uni)
+        await send(s, build(res, regime_section, ctx))
+
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+# ============================================================
+# CATATAN WORKFLOW (GitHub Actions YAML) — untuk regime_state.json
+# ============================================================
+# Tambahkan step INI setelah "python screener.py" di workflow yang sudah ada,
+# supaya reversal detection punya state dari cycle sebelumnya:
+#
+#   - name: Commit regime state
+#     run: |
+#       git config user.name "github-actions"
+#       git config user.email "actions@github.com"
+#       git add regime_state.json
+#       git diff --staged --quiet || git commit -m "chore: update regime state [skip ci]"
+#       git push
+#
+# "[skip ci]" WAJIB ada -- supaya commit ini sendiri tidak memicu run baru
+# (infinite loop trigger). Tidak perlu OI_TELEGRAM_TOKEN baru; regime_section
+# sudah ikut terkirim lewat send() yang sama, satu pesan, satu bot.
