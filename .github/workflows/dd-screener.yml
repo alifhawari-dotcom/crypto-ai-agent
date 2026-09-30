@@ -1,0 +1,64 @@
+# .github/workflows/dd-screener.yml
+#
+# Workflow TERPISAH untuk dd_screener.py (Decision Dashboard). Additive-only:
+# tidak menyentuh screener.py (Apex Quant) maupun oi_screener.py.
+#
+# Pasang:
+#   1. Taruh file ini di .github/workflows/dd-screener.yml
+#   2. Taruh dd_screener.py di root repo (sejajar oi_screener.py)
+#   3. Secret: pakai DD_TELEGRAM_TOKEN + DD_TELEGRAM_CHAT_ID (bot baru), atau
+#      biarkan kosong -> otomatis memakai OI_TELEGRAM_TOKEN / OI_TELEGRAM_CHAT_ID.
+#   4. Tes manual dulu: Actions > Run workflow, isi symbols=BTCUSDT,ETHUSDT dan full=true.
+#
+# TF default 1h -> jalan tiap jam di menit :07 (setelah candle 1h tertutup,
+# dan tidak bentrok dengan :00 / :30 milik screener lain).
+
+name: Decision Dashboard Screener
+
+on:
+  workflow_dispatch:
+    inputs:
+      symbols:
+        description: "Opsional: simbol dipisah koma (mis. BTCUSDT,ETHUSDT). Kosong = scan universe."
+        required: false
+        default: ""
+      full:
+        description: "Tampilkan dashboard lengkap untuk simbol di atas (abaikan filter sinyal)"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "7 * * * *"
+
+concurrency:
+  group: dd-screener-flow
+  cancel-in-progress: true
+
+jobs:
+  dd_screener_job:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: pip install aiohttp pandas numpy
+
+      - name: Run Decision Dashboard Screener
+        env:
+          DD_TELEGRAM_TOKEN: ${{ secrets.DD_TELEGRAM_TOKEN }}
+          DD_TELEGRAM_CHAT_ID: ${{ secrets.DD_TELEGRAM_CHAT_ID }}
+          OI_TELEGRAM_TOKEN: ${{ secrets.OI_TELEGRAM_TOKEN }}
+          OI_TELEGRAM_CHAT_ID: ${{ secrets.OI_TELEGRAM_CHAT_ID }}
+          IN_SYMBOLS: ${{ github.event.inputs.symbols }}
+          IN_FULL: ${{ github.event.inputs.full }}
+        run: |
+          ARGS=""
+          if [ -n "$IN_SYMBOLS" ]; then ARGS="$ARGS --symbols $IN_SYMBOLS"; fi
+          if [ "$IN_FULL" = "true" ]; then ARGS="$ARGS --full"; fi
+          python dd_screener.py $ARGS
