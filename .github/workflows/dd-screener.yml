@@ -3,15 +3,15 @@
 # Workflow TERPISAH untuk dd_screener.py (Decision Dashboard). Additive-only:
 # tidak menyentuh screener.py (Apex Quant) maupun oi_screener.py.
 #
-# Pasang:
-#   1. Taruh file ini di .github/workflows/dd-screener.yml
-#   2. Taruh dd_screener.py di root repo (sejajar oi_screener.py)
-#   3. Secret: pakai DD_TELEGRAM_TOKEN + DD_TELEGRAM_CHAT_ID (bot baru), atau
-#      biarkan kosong -> otomatis memakai OI_TELEGRAM_TOKEN / OI_TELEGRAM_CHAT_ID.
-#   4. Tes manual dulu: Actions > Run workflow, isi symbols=BTCUSDT,ETHUSDT dan full=true.
+# STATUS: jadwal otomatis DINONAKTIFKAN (10 Okt 2026).
+#   Bot DD sekarang khusus untuk alert Money Flow (flow_screener.py), yang
+#   dipicu dari oi.screener.yml lewat cron-job.org. Decision Dashboard masih
+#   bisa dijalankan manual lewat Actions > Run workflow bila diperlukan.
+#   Untuk mengaktifkan lagi, kembalikan blok:
+#     schedule:
+#       - cron: "7 * * * *"
 #
-# TF default 1h -> jalan tiap jam di menit :07 (setelah candle 1h tertutup,
-# dan tidak bentrok dengan :00 / :30 milik screener lain).
+# Tes manual: Actions > Run workflow, isi symbols=BTCUSDT,ETHUSDT dan full=true.
 
 name: Decision Dashboard Screener
 
@@ -26,8 +26,6 @@ on:
         description: "Tampilkan dashboard lengkap untuk simbol di atas (abaikan filter sinyal)"
         type: boolean
         default: false
-  schedule:
-    - cron: "7 * * * *"
 
 concurrency:
   group: dd-screener-flow
