@@ -1,10 +1,10 @@
 # .github/workflows/oi.screener.yml
 #
 # PEMICU:
-#  1. workflow_dispatch â€” WAJIB ADA. Ini pintu yang dipakai cron-job.org
+#  1. workflow_dispatch - WAJIB ADA. Ini pintu yang dipakai cron-job.org
 #     (endpoint /actions/workflows/<file>/dispatches). Kalau dihapus,
 #     cron-job.org langsung gagal 422. Juga dipakai untuk Run workflow manual.
-#  2. schedule â€” cadangan longgar (tiap jam). Sengaja TIDAK 15 menit supaya
+#  2. schedule - cadangan longgar (tiap jam). Sengaja TIDAK 15 menit supaya
 #     tidak tabrakan dengan cron-job.org yang sudah menangani frekuensi tinggi.
 #     Fungsinya jaring pengaman kalau cron-job.org down / token kedaluwarsa.
 #
@@ -13,6 +13,13 @@
 #  di cycle berikutnya). Step "Commit regime state" di bawah men-commit file
 #  itu balik ke repo. "[skip ci]" di commit message WAJIB ada, supaya commit
 #  ini sendiri tidak memicu run workflow baru (infinite loop trigger).
+#
+# MONEY FLOW SCREENER (ditambahkan, additive):
+#  Dijalankan SETELAH commit regime state, dengan continue-on-error, supaya
+#  kalau flow_screener.py gagal, OI screener & regime state tetap aman.
+#  Ikut pemicu cron-job.org milik OI screener, tapi pesan dikirim ke bot DD
+#  (DD_TELEGRAM_TOKEN / DD_TELEGRAM_CHAT_ID). Jika secret DD kosong,
+#  otomatis jatuh ke bot OI.
 
 name: OI/Funding/LS-Ratio Screener
 
@@ -59,3 +66,13 @@ jobs:
           git add regime_state.json
           git diff --staged --quiet || git commit -m "chore: update regime state [skip ci]"
           git push
+
+      - name: Run Money Flow Screener
+        continue-on-error: true
+        env:
+          DD_TELEGRAM_TOKEN: ${{ secrets.DD_TELEGRAM_TOKEN }}
+          DD_TELEGRAM_CHAT_ID: ${{ secrets.DD_TELEGRAM_CHAT_ID }}
+          OI_TELEGRAM_TOKEN: ${{ secrets.OI_TELEGRAM_TOKEN }}
+          OI_TELEGRAM_CHAT_ID: ${{ secrets.OI_TELEGRAM_CHAT_ID }}
+          FLOW_DIAGNOSTIC: ${{ secrets.FLOW_DIAGNOSTIC }}
+        run: python flow_screener.py
